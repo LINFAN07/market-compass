@@ -19,8 +19,8 @@ st.set_page_config(
 
 TW_TZ = pytz.timezone("Asia/Taipei")
 
-# 每 5 分鐘自動刷新
-st_autorefresh(interval=300_000, key="autorefresh")
+# 每 8 小時自動刷新
+st_autorefresh(interval=28_800_000, key="autorefresh")
 
 # ── 自訂樣式 ────────────────────────────────────────────────
 st.markdown("""
@@ -49,7 +49,7 @@ st.markdown("""
 
 # ── 資料抓取（TTL=300 秒快取）──────────────────────────────
 
-@st.cache_data(ttl=300, show_spinner=False)
+@st.cache_data(ttl=28800, show_spinner=False)
 def get_vix():
     """VIX 恐慌指數"""
     try:
@@ -67,7 +67,7 @@ def get_vix():
         return None
 
 
-@st.cache_data(ttl=300, show_spinner=False)
+@st.cache_data(ttl=28800, show_spinner=False)
 def get_fear_greed():
     """CNN 恐懼貪婪指數"""
     # 評級英文 → 中文對照
@@ -96,11 +96,13 @@ def get_fear_greed():
         rating_en = fg.get("rating", "").lower()
         rating_cn = RATING_CN.get(rating_en, rating_en)
         # 前期比較（可選）
+        prev_1d = fg.get("previous_close")
         prev_1w = fg.get("previous_1_week")
         prev_1m = fg.get("previous_1_month")
         return {
             "score": score,
             "rating": rating_cn,
+            "prev_1d": round(float(prev_1d), 1) if prev_1d else None,
             "prev_1w": round(float(prev_1w), 1) if prev_1w else None,
             "prev_1m": round(float(prev_1m), 1) if prev_1m else None,
         }
@@ -108,7 +110,7 @@ def get_fear_greed():
         return None
 
 
-@st.cache_data(ttl=300, show_spinner=False)
+@st.cache_data(ttl=28800, show_spinner=False)
 def get_market_breadth():
     """市場廣度：SPY / RSP / IWM"""
     try:
@@ -139,7 +141,7 @@ def get_market_breadth():
         return None
 
 
-@st.cache_data(ttl=300, show_spinner=False)
+@st.cache_data(ttl=28800, show_spinner=False)
 def get_credit():
     """信用市場：HYG / JNK + FRED 高收益利差"""
     try:
@@ -194,7 +196,7 @@ def get_credit():
         return None
 
 
-@st.cache_data(ttl=300, show_spinner=False)
+@st.cache_data(ttl=28800, show_spinner=False)
 def get_cross_assets():
     """跨資產：10Y美債殖利率 / 黃金 / 美元"""
     try:
@@ -220,7 +222,7 @@ def get_cross_assets():
         return None
 
 
-# ── 信號判讀邏輯 ────────────────────────────────────────────
+# ── 訊號判讀邏輯 ────────────────────────────────────────────
 
 def vix_zone(v):
     if v < 12:
@@ -246,24 +248,22 @@ def fg_label(s):
     return "極度貪婪", "#ef4444"
 
 
-def calc_recommendation(vix_cur, fg_score, rsp_vs_spy, hyg_5d, spread, tnx_chg=None, gld_chg=None):
+def calc_recommendation(vix_cur, fg_score, rsp_vs_spy, hyg_5d, spread, tnx_chg=None, gld_chg=None, uup_chg=None):
     """綜合評分 → 加倉/觀望/減倉建議"""
     score = 0
     crisis = False
 
     if vix_cur is not None:
-        if vix_cur > 30:
-            score += 2
-        elif vix_cur < 12:
-            score -= 3
-        elif vix_cur < 15:
-            score -= 2
+        if vix_cur > 40:       score += 3   # 極度恐慌，補最後子彈
+        elif vix_cur > 30:     score += 2   # 恐慌，第二批加倉
+        elif vix_cur > 25:     score += 1   # 情緒緊張，試水第一批
+        elif vix_cur < 12:     score -= 3
+        elif vix_cur < 15:     score -= 2
 
     if fg_score is not None:
-        if fg_score < 25:
-            score += 2
-        elif fg_score > 75:
-            score -= 2
+        if fg_score < 15:      score += 3   # 極度恐懼最深層，強烈逆向買入
+        elif fg_score < 25:    score += 2   # 極度恐懼
+        elif fg_score > 75:    score -= 2
 
     if rsp_vs_spy is not None:
         if rsp_vs_spy > 0.5:
@@ -281,7 +281,10 @@ def calc_recommendation(vix_cur, fg_score, rsp_vs_spy, hyg_5d, spread, tnx_chg=N
 
     if tnx_chg is not None and gld_chg is not None:
         if tnx_chg > 0.5 and gld_chg > 0.5:
-            score -= 1
+            score -= 1   # 殖利率↑+黃金↑ = 通膨/貨幣信用危機疑慮
+
+    if uup_chg is not None and uup_chg > 1:
+        score -= 1   # 美元暴漲 = 全球資金避險，非美資產承壓
 
     if crisis:
         return ("🚨 危機警告", "#dc2626",
@@ -291,15 +294,15 @@ def calc_recommendation(vix_cur, fg_score, rsp_vs_spy, hyg_5d, spread, tnx_chg=N
                 "多個訊號確認恐慌底部，可依 VIX 區間分批佈局（30%-30%-40%）")
     if score >= 1:
         return ("🟡 偏向加倉", "#84cc16",
-                "信號偏正面，可小量進場，保留後續加倉空間")
+                "訊號偏正面，可小量進場，保留後續加倉空間")
     if score <= -3:
         return ("🔴 考慮減倉", "#ef4444",
                 "市場過度樂觀，估值偏高，可減倉或轉向核心資產、賣 Covered Call")
     if score <= -1:
         return ("🟠 偏向謹慎", "#f97316",
-                "部分信號偏負面，不宜大幅加碼，注意風險")
+                "部分訊號偏負面，不宜大幅加碼，注意風險")
     return ("⏸️ 觀望", "#f59e0b",
-            "信號混合，等待更明確方向")
+            "訊號混合，等待更明確方向")
 
 
 # ── 通用小圖表 ──────────────────────────────────────────────
@@ -337,8 +340,8 @@ def main():
     # 標題列
     col_h, col_r = st.columns([6, 1])
     with col_h:
-        st.title("📊 美股加減倉決策儀表板")
-        st.caption(f"台北時間 {now}　｜　每 5 分鐘自動更新")
+        st.title("📊 美股加減倉決策儀表板", anchor=False)
+        st.caption(f"台北時間 {now}　｜　每 8 小時自動更新")
     with col_r:
         st.write("")
         st.write("")
@@ -363,8 +366,8 @@ def main():
 
     # ── VIX ──
     with c1:
-        _t, _i = st.columns([11, 1], vertical_alignment="center")
-        _t.subheader("😱 VIX 恐慌指數")
+        _t, _i = st.columns([10, 2], vertical_alignment="center")
+        _t.subheader("😱 VIX 恐慌指數", anchor=False)
         with _i:
             with st.popover("ℹ️"):
                 st.markdown("""
@@ -414,8 +417,8 @@ def main():
 
     # ── 恐懼貪婪指數 ──
     with c2:
-        _t, _i = st.columns([11, 1], vertical_alignment="center")
-        _t.subheader("📊 恐懼貪婪指數（CNN）")
+        _t, _i = st.columns([10, 2], vertical_alignment="center")
+        _t.subheader("📊 恐懼貪婪指數（CNN）", anchor=False)
         with _i:
             with st.popover("ℹ️"):
                 st.markdown("""
@@ -460,14 +463,16 @@ def main():
             )
             st.plotly_chart(fig, use_container_width=True)
 
-            # 趨勢比較（上週/上月）
+            # 趨勢比較（昨日/上週/上月）
+            parts = []
+            if fg.get("prev_1d") is not None and fg["prev_1d"] != fg["score"]:
+                parts.append(f"昨日：{fg['prev_1d']}（{fg['score'] - fg['prev_1d']:+.1f}）")
             if fg.get("prev_1w") is not None:
-                w_delta = fg["score"] - fg["prev_1w"]
-                m_delta = (fg["score"] - fg["prev_1m"]) if fg.get("prev_1m") else 0
-                st.caption(
-                    f"上週：{fg['prev_1w']}（{w_delta:+.1f}）　"
-                    f"上月：{fg['prev_1m']}（{m_delta:+.1f}）"
-                )
+                parts.append(f"上週：{fg['prev_1w']}（{fg['score'] - fg['prev_1w']:+.1f}）")
+            if fg.get("prev_1m") is not None:
+                parts.append(f"上月：{fg['prev_1m']}（{fg['score'] - fg['prev_1m']:+.1f}）")
+            if parts:
+                st.caption("　".join(parts))
 
             if fg["score"] < 25:
                 st.success("🎯 黃金組合：若同時 VIX > 30，為絕佳加倉確認點")
@@ -481,8 +486,8 @@ def main():
 
     # ── 市場廣度 ──
     with c3:
-        _t, _i = st.columns([11, 1], vertical_alignment="center")
-        _t.subheader("📐 市場廣度")
+        _t, _i = st.columns([10, 2], vertical_alignment="center")
+        _t.subheader("📐 市場廣度", anchor=False)
         with _i:
             with st.popover("ℹ️"):
                 st.markdown("""
@@ -502,7 +507,7 @@ def main():
             mc1, mc2, mc3 = st.columns(3)
             for col, sym in zip([mc1, mc2, mc3], ["SPY", "RSP", "IWM"]):
                 with col:
-                    st.metric(sym, f"${la[sym]['price']}",
+                    st.metric(sym, f"${la[sym]['price']:.0f}",
                               f"{la[sym]['chg_pct']:+.2f}%")
 
             rvs = breadth["rsp_vs_spy"]
@@ -532,8 +537,8 @@ def main():
 
     # ── 信用市場 ──
     with c4:
-        _t, _i = st.columns([11, 1], vertical_alignment="center")
-        _t.subheader("🏦 信用市場（高收益債）")
+        _t, _i = st.columns([10, 2], vertical_alignment="center")
+        _t.subheader("🏦 信用市場（高收益債）", anchor=False)
         with _i:
             with st.popover("ℹ️"):
                 st.markdown("""
@@ -594,8 +599,8 @@ def main():
 
     # ── 跨資產聯動 ──
     with c5:
-        _t, _i = st.columns([11, 1], vertical_alignment="center")
-        _t.subheader("🌐 跨資產聯動")
+        _t, _i = st.columns([10, 2], vertical_alignment="center")
+        _t.subheader("🌐 跨資產聯動", anchor=False)
         with _i:
             with st.popover("ℹ️"):
                 st.markdown("""
@@ -648,7 +653,13 @@ def main():
     # ────────────────────────────────────────────────────────
     # 綜合建議
     # ────────────────────────────────────────────────────────
-    st.subheader("🎯 綜合建議")
+    st.markdown(
+        "<div style='display:flex; align-items:baseline; gap:8px; margin-bottom:8px;'>"
+        "<span style='font-size:1.5rem; font-weight:700; color:#1e293b;'>🎯 綜合建議</span>"
+        "<span style='color:#94a3b8; font-size:0.8rem;'>（僅供參考，非投資建議。）</span>"
+        "</div>",
+        unsafe_allow_html=True,
+    )
 
     rec_label, rec_color, rec_desc = calc_recommendation(
         vix["current"]                     if vix     else None,
@@ -658,25 +669,129 @@ def main():
         credit["spread"]                   if credit  else None,
         cross["latest"]["^TNX"]["chg_pct"] if cross   else None,
         cross["latest"]["GLD"]["chg_pct"]  if cross   else None,
+        cross["latest"]["UUP"]["chg_pct"]  if cross   else None,
     )
 
+    # 六階段進度條：當前階段高亮，其餘淡化
+    STAGES = [
+        ("🚨 危機警告", "#dc2626"),
+        ("🔴 考慮減倉", "#ef4444"),
+        ("🟠 偏向謹慎", "#f97316"),
+        ("⏸️ 觀望",    "#f59e0b"),
+        ("🟡 偏向加倉", "#84cc16"),
+        ("✅ 加倉機會", "#22c55e"),
+    ]
+    cards = ""
+    for lbl, clr in STAGES:
+        if lbl == rec_label:
+            style = (
+                f"flex:1;text-align:center;padding:12px 4px;border-radius:10px;"
+                f"background:{clr}33;border:2px solid {clr};"
+                f"color:{clr};font-weight:bold;font-size:0.88rem;"
+            )
+        else:
+            style = (
+                "flex:1;text-align:center;padding:12px 4px;border-radius:10px;"
+                "background:rgba(255,255,255,0.03);border:1px solid rgba(255,255,255,0.12);"
+                "color:#888;font-size:0.85rem;"
+            )
+        cards += f'<div style="{style}">{lbl}</div>'
+    st.markdown(
+        f'<div style="display:flex;gap:6px;margin:14px 0 10px 0;">{cards}</div>',
+        unsafe_allow_html=True,
+    )
+
+    # 說明文字
     st.markdown(f"""
     <div style="
         background:{rec_color}22;
         border:2px solid {rec_color};
         border-radius:12px;
-        padding:22px 28px;
+        padding:16px 28px;
         text-align:center;
-        margin:6px 0 18px 0;
+        margin:0 0 18px 0;
     ">
-        <div style="font-size:2rem; font-weight:bold; color:{rec_color};">{rec_label}</div>
-        <div style="font-size:0.95rem; margin-top:8px; color:#bbb;">{rec_desc}</div>
+        <div style="font-size:1.2rem; font-weight:700; color:#1d4ed8;">{rec_desc}</div>
     </div>
     """, unsafe_allow_html=True)
 
     # ────────────────────────────────────────────────────────
-    # 參考策略折疊區塊
+    # 折疊區塊
     # ────────────────────────────────────────────────────────
+    with st.expander("📖 綜合建議的評分基準"):
+        _col_left, _col_right = st.columns(2)
+        with _col_left:
+            st.markdown("""
+**各訊號加減分條件**
+
+| 訊號 | 條件 | 分數 |
+|------|------|:----:|
+| **VIX 恐慌指數** | VIX > 40（極度恐慌，補最後子彈） | +3 |
+| | VIX 30–40（恐慌，第二批加倉） | +2 |
+| | VIX 25–30（情緒緊張，試水第一批） | +1 |
+| | VIX < 12（極度自滿） | -3 |
+| | VIX 12–15（市場自滿） | -2 |
+| **恐懼貪婪指數** | F&G < 15（極度恐懼最深層，強烈逆向買入） | +3 |
+| | F&G 15–25（極度恐懼） | +2 |
+| | F&G > 75（極度貪婪） | -2 |
+| **市場廣度** | RSP 近5日跑贏 SPY > 0.5% | +1 |
+| | RSP 近5日落後 SPY > 1% | -1 |
+| **信用市場** | HYG 近5日 ≥ 0%（信用穩定） | +1 |
+| | HYG 近5日 < -2%（信用惡化） | -2 |
+| **跨資產** | TNX 單日漲 > 0.5% 且 GLD 單日漲 > 0.5% | -1 |
+| | 美元（UUP）單日漲 > 1%（全球資金避險） | -1 |
+| **信用利差** | 高收益利差（FRED） > 6% | 直接觸發危機警告 |
+            """)
+        with _col_right:
+            st.markdown("""
+**六種建議對應**
+
+<table style="width:100%; border-collapse:collapse; font-size:0.9rem;">
+  <thead>
+    <tr style="border-bottom:2px solid #e2e8f0;">
+      <th style="width:80px; text-align:center; padding:6px 8px; white-space:nowrap;">總分</th>
+      <th style="width:110px; padding:6px 8px; white-space:nowrap;">建議</th>
+      <th style="padding:6px 8px;">說明</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr style="border-bottom:1px solid #e2e8f0;">
+      <td style="text-align:center; padding:6px 8px; white-space:nowrap;">危機觸發</td>
+      <td style="padding:6px 8px; white-space:nowrap;">🚨 危機警告</td>
+      <td style="padding:6px 8px;">高收益利差 > 6%，系統性危機風險，切勿急於抄底</td>
+    </tr>
+    <tr style="border-bottom:1px solid #e2e8f0;">
+      <td style="text-align:center; padding:6px 8px; white-space:nowrap;">≥ 3</td>
+      <td style="padding:6px 8px; white-space:nowrap;">✅ 加倉機會</td>
+      <td style="padding:6px 8px;">多訊號確認恐慌底部，可依 VIX 區間分批佈局（30%-30%-40%）</td>
+    </tr>
+    <tr style="border-bottom:1px solid #e2e8f0;">
+      <td style="text-align:center; padding:6px 8px; white-space:nowrap;">1–2</td>
+      <td style="padding:6px 8px; white-space:nowrap;">🟡 偏向加倉</td>
+      <td style="padding:6px 8px;">訊號偏正面，可小量進場，保留後續加倉空間</td>
+    </tr>
+    <tr style="border-bottom:1px solid #e2e8f0;">
+      <td style="text-align:center; padding:6px 8px; white-space:nowrap;">0</td>
+      <td style="padding:6px 8px; white-space:nowrap;">⏸️ 觀望</td>
+      <td style="padding:6px 8px;">訊號混合，等待更明確方向</td>
+    </tr>
+    <tr style="border-bottom:1px solid #e2e8f0;">
+      <td style="text-align:center; padding:6px 8px; white-space:nowrap;">-1 至 -2</td>
+      <td style="padding:6px 8px; white-space:nowrap;">🟠 偏向謹慎</td>
+      <td style="padding:6px 8px;">部分訊號偏負面，不宜大幅加碼，注意風險</td>
+    </tr>
+    <tr>
+      <td style="text-align:center; padding:6px 8px; white-space:nowrap;">≤ -3</td>
+      <td style="padding:6px 8px; white-space:nowrap;">🔴 考慮減倉</td>
+      <td style="padding:6px 8px;">市場過度樂觀，估值偏高，可減倉或轉向核心資產、賣 Covered Call</td>
+    </tr>
+  </tbody>
+</table>
+
+> **黃金加倉**：VIX > 30 且 F&G < 25
+> **黃金減倉**：VIX < 15 且 F&G > 75
+            """, unsafe_allow_html=True)
+
     col_exp1, col_exp2 = st.columns(2)
     with col_exp1:
         with st.expander("📖 VIX 分批加倉策略（30-30-40）"):
