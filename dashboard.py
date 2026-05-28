@@ -15,7 +15,7 @@ from streamlit_autorefresh import st_autorefresh
 
 # ── 頁面設定 ────────────────────────────────────────────────
 st.set_page_config(
-    page_title="加減倉決策儀表板",
+    page_title="台股 + 美股加減倉決策儀表板",
     page_icon="📊",
     layout="wide",
 )
