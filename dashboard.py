@@ -257,19 +257,14 @@ def get_tw_vix_proxy():
 
 @st.cache_data(ttl=28800, show_spinner=False)
 def get_tw_chips():
-    """外資臺指期淨部位（TAIFEX OpenAPI）+ 融資金額日變動（TWSE JSON）"""
+    """外資臺指期淨部位（TAIFEX OpenAPI）"""
 
     result = {
         "foreign_net_oi":    None,  # 最新外資淨部位（正=多，負=空）
-        "foreign_3d_change": None,  # 近3交易日累計變動（OpenAPI 僅提供最新日，暫設 None）
-        "margin_chg_pct":    None,  # 融資金額日變動%
-        "margin_today":      None,
-        "margin_prev":       None,
+        "foreign_3d_change": None,  # 近3交易日累計變動
     }
 
     # ── TAIFEX OpenAPI：外資臺股期貨淨未平倉口數 ──
-    # 來源：https://openapi.taifex.com.tw/v1/MarketDataOfMajorInstitutionalTradersDetailsOfFuturesContractsBytheDate
-    # 注意：舊版 HTML 解析失效（TAIFEX 已改為 JS 動態載入）
     try:
         r = requests.get(
             "https://openapi.taifex.com.tw/v1/MarketDataOfMajorInstitutionalTradersDetailsOfFuturesContractsBytheDate",
@@ -284,35 +279,67 @@ def get_tw_chips():
     except Exception:
         pass
 
-    # ── TWSE 融資金額（今日 vs 前日）──
-    try:
-        r = requests.get(
-            "https://www.twse.com.tw/rwd/zh/marginTrading/MI_MARGN?response=json",
-            headers={"User-Agent": "Mozilla/5.0"},
-            timeout=10,
-        )
-        data = r.json()
-        fields = data.get("fields", [])
-        rows   = data.get("data", [])
-
-        # 用欄位名稱找「融資餘額金額」的 index，找不到就試 index 9
-        bal_idx = next(
-            (i for i, f in enumerate(fields) if "融資" in f and "餘額" in f and ("金額" in f or "仟元" in f)),
-            9,
-        )
-
-        total_rows = [row for row in rows if "合計" in str(row[0])]
-        if len(total_rows) >= 2:
-            t = int(total_rows[-1][bal_idx].replace(",", ""))
-            p = int(total_rows[-2][bal_idx].replace(",", ""))
-            if p > 0 and t > 0:
-                result["margin_today"]   = t
-                result["margin_prev"]    = p
-                result["margin_chg_pct"] = round((t / p - 1) * 100, 3)
-    except Exception:
-        pass
-
     return result
+
+
+@st.cache_data(ttl=28800, show_spinner=False)
+def get_tw_margin_history():
+    """融資餘額歷史（TWSE MI_MARGN，近20個交易日）
+
+    MI_MARGN 格式：tables[0]["data"] 每列一個類別，最後列為全市場合計，
+    最後欄為今日餘額（仟元）。用 date=YYYYMMDD 逐日查詢。
+    """
+
+    def fetch_balance(date_str):
+        """查單日全市場融資餘額（仟元）→ 億元；無資料回傳 None"""
+        try:
+            r = requests.get(
+                f"https://www.twse.com.tw/rwd/zh/marginTrading/MI_MARGN?date={date_str}&response=json",
+                headers={"User-Agent": "Mozilla/5.0"},
+                timeout=10,
+            )
+            data = r.json()
+            if data.get("stat") != "OK":
+                return None
+            tables = data.get("tables", [])
+            if not tables:
+                return None
+            rows = tables[0].get("data", [])
+            if not rows:
+                return None
+            # 最後一列 = 全市場合計；最後一欄 = 今日餘額（仟元）
+            bal = int(str(rows[-1][-1]).replace(",", ""))
+            return round(bal / 100000, 2)  # 仟元 → 億元（÷100,000）
+        except Exception:
+            return None
+
+    # 往前找最多 30 個日曆日，取最近 20 個有效交易日
+    history = {}
+    for delta in range(0, 31):
+        d = datetime.now(TW_TZ) - timedelta(days=delta)
+        bal = fetch_balance(d.strftime("%Y%m%d"))
+        if bal is not None:
+            history[d.strftime("%m/%d")] = bal
+            if len(history) >= 20:
+                break
+
+    if not history:
+        return None
+
+    # 轉成 Series（由舊到新排列）
+    series = pd.Series(dict(reversed(list(history.items()))))
+
+    chg_pct = None
+    if len(series) >= 2:
+        t, p = float(series.iloc[-1]), float(series.iloc[-2])
+        if p > 0:
+            chg_pct = round((t / p - 1) * 100, 3)
+
+    return {
+        "series":  series,
+        "chg_pct": chg_pct,
+        "latest":  round(float(series.iloc[-1]), 0),
+    }
 
 
 @st.cache_data(ttl=28800, show_spinner=False)
@@ -704,12 +731,13 @@ def main():
     # ════════════════════════════════════════════════════════
     with tab_tw:
         with st.spinner("載入台股資料（TAIFEX / TWSE / yfinance）…"):
-            tw_vix       = get_tw_vix_proxy()
-            tw_chips     = get_tw_chips()
-            tw_inst_cash = get_tw_institutional_cash()
-            tw_breadth   = get_tw_market_breadth()
-            tw_credit    = get_tw_credit()
-            tw_cross     = get_tw_cross_assets()
+            tw_vix        = get_tw_vix_proxy()
+            tw_chips      = get_tw_chips()
+            tw_inst_cash  = get_tw_institutional_cash()
+            tw_margin     = get_tw_margin_history()
+            tw_breadth    = get_tw_market_breadth()
+            tw_credit     = get_tw_credit()
+            tw_cross      = get_tw_cross_assets()
 
         # ────────────────────────────────────────────────────
         # 第一行：HV20 波動率 / 籌碼面 / 市場廣度
@@ -878,18 +906,29 @@ def main():
                 else:
                     st.warning("三大法人現股資料暫時無法取得（TWSE 連線問題）")
 
-                # 融資金額代理
-                chg = tw_chips.get("margin_chg_pct")
-                if chg is not None:
-                    st.divider()
-                    st.metric("融資金額日變動（代理）", f"{chg:+.3f}%",
-                              help="TWSE API 僅提供金額，非直接維持率")
-                    if chg < -0.5:
-                        st.success(f"融資金額減少 {abs(chg):.3f}%，槓桿收縮（斷頭壓力訊號）")
-                    elif chg > 0.5:
-                        st.warning(f"融資金額增加 {chg:.3f}%，槓桿持續上升，留意過熱")
-                    else:
-                        st.info(f"融資金額變動平穩（{chg:+.3f}%）")
+                # 融資餘額趨勢
+                st.divider()
+                st.caption("📉 融資餘額（⚠️代理維持率方向）")
+                if tw_margin:
+                    chg = tw_margin["chg_pct"]
+                    bal = tw_margin["latest"]
+                    delta_str = f"{chg:+.3f}%" if chg is not None else ""
+                    st.metric("融資餘額（近20日最新）", f"{bal:,.0f}億", delta_str,
+                              help="仟元→億元換算；日變動作為維持率方向代理")
+                    if chg is not None:
+                        if chg < -0.5:
+                            st.success(f"融資餘額減少 {abs(chg):.3f}%，槓桿收縮（斷頭壓力訊號）")
+                        elif chg > 0.5:
+                            st.warning(f"融資餘額增加 {chg:.3f}%，槓桿持續上升，留意過熱")
+                        else:
+                            st.info(f"融資餘額日變動 {chg:+.3f}%，平穩")
+                    fig = mini_chart(
+                        {"融資餘額（億）": (tw_margin["series"], "#a78bfa")},
+                        height=130,
+                    )
+                    st.plotly_chart(fig, use_container_width=True)
+                else:
+                    st.info("融資餘額歷史資料暫無法取得")
             else:
                 st.error("籌碼資料載入失敗")
 
@@ -1074,7 +1113,7 @@ def main():
             hv20_falling      = tw_vix["falling"]        if tw_vix    else False,
             foreign_net_oi    = tw_chips.get("foreign_net_oi")    if tw_chips  else None,
             foreign_3d_change = tw_chips.get("foreign_3d_change") if tw_chips  else None,
-            margin_chg_pct    = tw_chips.get("margin_chg_pct")    if tw_chips  else None,
+            margin_chg_pct    = tw_margin["chg_pct"] if tw_margin else None,
             otc_vs_taiex_5d   = tw_breadth["otc_vs_taiex_5d"]     if tw_breadth else None,
             twd_5d            = tw_credit["twd_5d"]      if tw_credit else None,
             twd_3d            = tw_credit["twd_3d"]      if tw_credit else None,
