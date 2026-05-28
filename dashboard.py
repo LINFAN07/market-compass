@@ -847,32 +847,32 @@ def main():
                         if f1 is not None:
                             f_dir = "買超" if f1 >= 0 else "賣超"
                             st.metric("外資現股（今日）",
-                                      f"{f_dir} {abs(f1):.1f}億",
-                                      f"3日累 {f3:+.1f}億" if f3 is not None else "")
+                                      f"{f_dir} {abs(f1):.0f}億",
+                                      f"3日累 {f3:+.0f}億" if f3 is not None else "")
                             if f3 is not None:
                                 if f3 > 100:
-                                    st.success(f"外資近3日買超 {f3:.1f}億，資金流入")
+                                    st.success(f"外資近3日買超 {f3:.0f}億，資金流入")
                                 elif f3 < -200:
-                                    st.error(f"⚠️ 外資近3日賣超 {abs(f3):.1f}億，大量撤資")
+                                    st.error(f"⚠️ 外資近3日賣超 {abs(f3):.0f}億，大量撤資")
                                 elif f3 < -100:
-                                    st.warning(f"外資近3日賣超 {abs(f3):.1f}億，偏向出場")
+                                    st.warning(f"外資近3日賣超 {abs(f3):.0f}億，偏向出場")
                                 else:
-                                    st.info(f"外資近3日 {f3:+.1f}億，未達警戒")
+                                    st.info(f"外資近3日 {f3:+.0f}億，未達警戒")
                         else:
                             st.info("外資現股資料未取得")
                     with ic2:
                         if s1 is not None:
                             s_dir = "買超" if s1 >= 0 else "賣超"
                             st.metric("投信現股（今日）",
-                                      f"{s_dir} {abs(s1):.1f}億",
-                                      f"3日累 {s3:+.1f}億" if s3 is not None else "")
+                                      f"{s_dir} {abs(s1):.0f}億",
+                                      f"3日累 {s3:+.0f}億" if s3 is not None else "")
                             if s3 is not None:
                                 if s3 > 30:
-                                    st.success(f"投信近3日買超 {s3:.1f}億，護盤訊號")
+                                    st.success(f"投信近3日買超 {s3:.0f}億，護盤訊號")
                                 elif s3 < -15:
-                                    st.warning(f"投信近3日賣超 {abs(s3):.1f}億")
+                                    st.warning(f"投信近3日賣超 {abs(s3):.0f}億")
                                 else:
-                                    st.info(f"投信近3日 {s3:+.1f}億")
+                                    st.info(f"投信近3日 {s3:+.0f}億")
                         else:
                             st.info("投信資料未取得")
                 else:
