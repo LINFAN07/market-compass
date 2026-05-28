@@ -316,6 +316,68 @@ def get_tw_chips():
 
 
 @st.cache_data(ttl=28800, show_spinner=False)
+def get_tw_institutional_cash():
+    """三大法人現股買賣超（TWSE BFI82U，外資 + 投信）"""
+    result = {
+        "foreign_net_3d": None,   # 外資近3日淨買賣超（億元，正=買，負=賣）
+        "sitc_net_3d":    None,   # 投信近3日淨買賣超（億元）
+        "foreign_net_1d": None,   # 最新一日外資淨買賣超（億元）
+        "sitc_net_1d":    None,   # 最新一日投信淨買賣超（億元）
+        "display_rows":   [],     # 近3日明細（供 UI 顯示）
+    }
+    try:
+        r = requests.get(
+            "https://www.twse.com.tw/rwd/zh/fund/BFI82U?response=json",
+            headers={"User-Agent": "Mozilla/5.0"},
+            timeout=12,
+        )
+        data = r.json()
+        if data.get("stat") != "OK":
+            return result
+
+        rows = data.get("data", [])
+        if not rows:
+            return result
+
+        # BFI82U 固定欄位結構（0-based）：
+        # 0: 日期 | 1-3: 外資（不含自營）買/賣/差(元) | 4-6: 外資自營 | 7-9: 投信買/賣/差(元) | 10-12: 自營商
+        FOREIGN_IDX, SITC_IDX = 3, 9
+
+        def parse_yi(s):
+            """字串金額（元）→ 億元"""
+            try:
+                return round(int(str(s).replace(",", "")) / 1e8, 2)
+            except Exception:
+                return None
+
+        # 濾掉非日期列（如合計），只保留含「/」的日期列
+        valid = [row for row in rows if row and "/" in str(row[0]) and len(row) > SITC_IDX]
+        recent = valid[-3:]  # 最近3個交易日
+
+        f_vals = [parse_yi(row[FOREIGN_IDX]) for row in recent]
+        s_vals = [parse_yi(row[SITC_IDX])    for row in recent]
+        f_vals = [v for v in f_vals if v is not None]
+        s_vals = [v for v in s_vals if v is not None]
+
+        if f_vals:
+            result["foreign_net_1d"] = f_vals[-1]
+            result["foreign_net_3d"] = round(sum(f_vals), 2)
+        if s_vals:
+            result["sitc_net_1d"] = s_vals[-1]
+            result["sitc_net_3d"] = round(sum(s_vals), 2)
+
+        for row in recent:
+            result["display_rows"].append({
+                "date":    row[0],
+                "foreign": parse_yi(row[FOREIGN_IDX]),
+                "sitc":    parse_yi(row[SITC_IDX]),
+            })
+    except Exception:
+        pass
+    return result
+
+
+@st.cache_data(ttl=28800, show_spinner=False)
 def get_tw_market_breadth():
     """台股市場廣度：^TWII（加權）vs ^TWOII（櫃買）"""
     try:
@@ -497,6 +559,8 @@ def calc_tw_recommendation(
     twd_5d, twd_3d,
     sox_below_ma60, dxy_5d,
     taiex_3d,
+    foreign_cash_3d=None,
+    sitc_3d=None,
 ):
     """台股綜合評分 → 加倉/觀望/減倉建議"""
     score, crisis = 0, False
@@ -541,6 +605,19 @@ def calc_tw_recommendation(
             score -= 2
         elif twd_5d < -0.5:
             score += 1
+
+    # ── 外資現股買賣超（連3日方向）──
+    if foreign_cash_3d is not None:
+        if foreign_cash_3d > 100:
+            score += 1    # 持續買入，資金流入確認
+        elif foreign_cash_3d < -200:
+            score -= 2    # 大量撤資
+        elif foreign_cash_3d < -100:
+            score -= 1    # 偏向出場
+
+    # ── 投信現股（護盤訊號）──
+    if sitc_3d is not None and sitc_3d > 30:
+        score += 1
 
     # ── 跨資產：SOX破季線 + DXY急漲 ──
     if sox_below_ma60 and dxy_5d is not None and dxy_5d > 1.5:
@@ -616,11 +693,12 @@ def main():
     # ════════════════════════════════════════════════════════
     with tab_tw:
         with st.spinner("載入台股資料（TAIFEX / TWSE / yfinance）…"):
-            tw_vix    = get_tw_vix_proxy()
-            tw_chips  = get_tw_chips()
-            tw_breadth = get_tw_market_breadth()
-            tw_credit  = get_tw_credit()
-            tw_cross   = get_tw_cross_assets()
+            tw_vix       = get_tw_vix_proxy()
+            tw_chips     = get_tw_chips()
+            tw_inst_cash = get_tw_institutional_cash()
+            tw_breadth   = get_tw_market_breadth()
+            tw_credit    = get_tw_credit()
+            tw_cross     = get_tw_cross_assets()
 
         # ────────────────────────────────────────────────────
         # 第一行：HV20 波動率 / 籌碼面 / 市場廣度
@@ -699,6 +777,20 @@ def main():
 | 淨空單 > 30,000 口 | -2（外資強烈看空） |
 | 近3日累計回補 > 10,000 口 | +1（外資態度轉向） |
 
+**外資現股買賣超**（來源：TWSE BFI82U）
+
+| 條件 | 評分 |
+|------|------|
+| 近3日累計買超 > 100億 | +1（資金持續流入） |
+| 近3日累計賣超 > 100億 | -1（外資偏向出場） |
+| 近3日累計賣超 > 200億 | -2（外資大量撤資） |
+
+**投信現股買賣超**（來源：TWSE BFI82U）
+
+| 條件 | 評分 |
+|------|------|
+| 近3日累計買超 > 30億 | +1（投信護盤） |
+
 **融資金額日變動**（來源：TWSE，⚠️代理指標）
 
 | 條件 | 評分 |
@@ -730,6 +822,50 @@ def main():
                             st.success("外資近3日大幅回補，態度轉向，與HV20共振可加倉")
                 else:
                     st.warning("外資期貨資料暫時無法取得（TAIFEX 連線問題）")
+
+                # 三大法人現股買賣超
+                st.divider()
+                st.caption("💹 三大法人現股（TWSE BFI82U）")
+                if tw_inst_cash:
+                    f1 = tw_inst_cash.get("foreign_net_1d")
+                    f3 = tw_inst_cash.get("foreign_net_3d")
+                    s1 = tw_inst_cash.get("sitc_net_1d")
+                    s3 = tw_inst_cash.get("sitc_net_3d")
+                    ic1, ic2 = st.columns(2)
+                    with ic1:
+                        if f1 is not None:
+                            f_dir = "買超" if f1 >= 0 else "賣超"
+                            st.metric("外資現股（今日）",
+                                      f"{f_dir} {abs(f1):.1f}億",
+                                      f"3日累 {f3:+.1f}億" if f3 is not None else "")
+                            if f3 is not None:
+                                if f3 > 100:
+                                    st.success(f"外資近3日買超 {f3:.1f}億，資金流入")
+                                elif f3 < -200:
+                                    st.error(f"⚠️ 外資近3日賣超 {abs(f3):.1f}億，大量撤資")
+                                elif f3 < -100:
+                                    st.warning(f"外資近3日賣超 {abs(f3):.1f}億，偏向出場")
+                                else:
+                                    st.info(f"外資近3日 {f3:+.1f}億，未達警戒")
+                        else:
+                            st.info("外資現股資料未取得")
+                    with ic2:
+                        if s1 is not None:
+                            s_dir = "買超" if s1 >= 0 else "賣超"
+                            st.metric("投信現股（今日）",
+                                      f"{s_dir} {abs(s1):.1f}億",
+                                      f"3日累 {s3:+.1f}億" if s3 is not None else "")
+                            if s3 is not None:
+                                if s3 > 30:
+                                    st.success(f"投信近3日買超 {s3:.1f}億，護盤訊號")
+                                elif s3 < -15:
+                                    st.warning(f"投信近3日賣超 {abs(s3):.1f}億")
+                                else:
+                                    st.info(f"投信近3日 {s3:+.1f}億")
+                        else:
+                            st.info("投信資料未取得")
+                else:
+                    st.warning("三大法人現股資料暫時無法取得（TWSE 連線問題）")
 
                 # 融資金額代理
                 chg = tw_chips.get("margin_chg_pct")
@@ -923,17 +1059,19 @@ def main():
         )
 
         tw_rec_label, tw_rec_color, tw_rec_desc = calc_tw_recommendation(
-            hv20            = tw_vix["hv20"]          if tw_vix    else None,
-            hv20_falling    = tw_vix["falling"]        if tw_vix    else False,
-            foreign_net_oi  = tw_chips.get("foreign_net_oi")   if tw_chips  else None,
-            foreign_3d_change = tw_chips.get("foreign_3d_change") if tw_chips else None,
-            margin_chg_pct  = tw_chips.get("margin_chg_pct")   if tw_chips  else None,
-            otc_vs_taiex_5d = tw_breadth["otc_vs_taiex_5d"]    if tw_breadth else None,
-            twd_5d          = tw_credit["twd_5d"]      if tw_credit else None,
-            twd_3d          = tw_credit["twd_3d"]      if tw_credit else None,
-            sox_below_ma60  = tw_cross["sox_below_ma60"] if tw_cross else False,
-            dxy_5d          = tw_cross["dxy_5d"]        if tw_cross else None,
-            taiex_3d        = tw_breadth["taiex_3d"]    if tw_breadth else None,
+            hv20              = tw_vix["hv20"]          if tw_vix    else None,
+            hv20_falling      = tw_vix["falling"]        if tw_vix    else False,
+            foreign_net_oi    = tw_chips.get("foreign_net_oi")    if tw_chips  else None,
+            foreign_3d_change = tw_chips.get("foreign_3d_change") if tw_chips  else None,
+            margin_chg_pct    = tw_chips.get("margin_chg_pct")    if tw_chips  else None,
+            otc_vs_taiex_5d   = tw_breadth["otc_vs_taiex_5d"]     if tw_breadth else None,
+            twd_5d            = tw_credit["twd_5d"]      if tw_credit else None,
+            twd_3d            = tw_credit["twd_3d"]      if tw_credit else None,
+            sox_below_ma60    = tw_cross["sox_below_ma60"] if tw_cross else False,
+            dxy_5d            = tw_cross["dxy_5d"]        if tw_cross else None,
+            taiex_3d          = tw_breadth["taiex_3d"]    if tw_breadth else None,
+            foreign_cash_3d   = tw_inst_cash.get("foreign_net_3d") if tw_inst_cash else None,
+            sitc_3d           = tw_inst_cash.get("sitc_net_3d")    if tw_inst_cash else None,
         )
 
         TW_STAGES = [
@@ -994,6 +1132,10 @@ def main():
 | | 單日增加 > 0.5% | -1 |
 | **外資期貨** | 淨空單 > 30,000 口 | -2 |
 | | 近3日累計回補 > 10,000 口 | +1 |
+| **外資現股** | 近3日累計買超 > 100億 | +1 |
+| | 近3日累計賣超 > 100億 | -1 |
+| | 近3日累計賣超 > 200億 | -2 |
+| **投信現股** | 近3日累計買超 > 30億 | +1 |
 | **市場廣度** | OTC 近5日跑贏加權 > 1% | +1 |
 | | OTC 近5日落後加權 > 1.5% | -1 |
 | **台幣匯率** | 近5日升值 > 0.5% | +1 |
@@ -1047,8 +1189,8 @@ def main():
   </tbody>
 </table>
 
-> **黃金加倉組合**：HV20 > 28% 回落 + 外資期貨回補
-> **黃金減倉組合**：HV20 < 12% + 融資金額持續上升
+> **黃金加倉組合**：HV20 > 28% 回落 + 外資期貨回補 + 外資現股買超
+> **黃金減倉組合**：HV20 < 12% + 融資金額持續上升 + 外資現股賣超
                 """, unsafe_allow_html=True)
 
         with st.expander("📖 台股 3-3-4 分批建倉策略"):
@@ -1061,7 +1203,7 @@ def main():
 | **> 28% 且↑** | 恐慌仍升 | **小量試水** | **30%** |
 | **> 28% 且↓確認** | 恐慌見頂 | **第三批確認** | **40%** |
 
-> **黃金加倉組合**：HV20 > 28% 且回落 + 外資期貨回補 > 10,000 口
+> **黃金加倉組合**：HV20 > 28% 且回落 + 外資期貨回補 > 10,000 口 + 外資現股近3日買超
 """)
 
     # ════════════════════════════════════════════════════════
