@@ -317,63 +317,74 @@ def get_tw_chips():
 
 @st.cache_data(ttl=28800, show_spinner=False)
 def get_tw_institutional_cash():
-    """三大法人現股買賣超（TWSE BFI82U，外資 + 投信）"""
+    """三大法人現股買賣超（TWSE BFI82U，外資 + 投信，近3個交易日）
+
+    BFI82U 格式：每列一個法人，欄位 [單位名稱, 買進金額, 賣出金額, 買賣差額]（元）
+    需逐日查詢（dayDate=YYYYMMDD），最多往前找7個日曆日取3個交易日。
+    """
     result = {
-        "foreign_net_3d": None,   # 外資近3日淨買賣超（億元，正=買，負=賣）
-        "sitc_net_3d":    None,   # 投信近3日淨買賣超（億元）
-        "foreign_net_1d": None,   # 最新一日外資淨買賣超（億元）
-        "sitc_net_1d":    None,   # 最新一日投信淨買賣超（億元）
-        "display_rows":   [],     # 近3日明細（供 UI 顯示）
+        "foreign_net_3d": None,
+        "sitc_net_3d":    None,
+        "foreign_net_1d": None,
+        "sitc_net_1d":    None,
+        "display_rows":   [],
     }
-    try:
-        r = requests.get(
-            "https://www.twse.com.tw/rwd/zh/fund/BFI82U?response=json",
-            headers={"User-Agent": "Mozilla/5.0"},
-            timeout=12,
-        )
-        data = r.json()
-        if data.get("stat") != "OK":
-            return result
 
-        rows = data.get("data", [])
-        if not rows:
-            return result
+    def parse_yi(s):
+        """字串金額（元）→ 億元"""
+        try:
+            return round(int(str(s).replace(",", "")) / 1e8, 2)
+        except Exception:
+            return None
 
-        # BFI82U 固定欄位結構（0-based）：
-        # 0: 日期 | 1-3: 外資（不含自營）買/賣/差(元) | 4-6: 外資自營 | 7-9: 投信買/賣/差(元) | 10-12: 自營商
-        FOREIGN_IDX, SITC_IDX = 3, 9
+    def fetch_day(date_str):
+        """查單日資料，回傳 (foreign_億元, sitc_億元)；無資料回傳 (None, None)"""
+        try:
+            r = requests.get(
+                f"https://www.twse.com.tw/rwd/zh/fund/BFI82U?dayDate={date_str}&response=json",
+                headers={"User-Agent": "Mozilla/5.0"},
+                timeout=12,
+            )
+            data = r.json()
+            if data.get("stat") != "OK":
+                return None, None
+            rows = data.get("data", [])
+            foreign, sitc = None, None
+            for row in rows:
+                name = str(row[0])
+                if "外資及陸資" in name and "不含" in name:  # 排除「外資自營商」獨立列
+                    foreign = parse_yi(row[3])
+                elif "投信" == name.strip():
+                    sitc = parse_yi(row[3])
+            return foreign, sitc
+        except Exception:
+            return None, None
 
-        def parse_yi(s):
-            """字串金額（元）→ 億元"""
-            try:
-                return round(int(str(s).replace(",", "")) / 1e8, 2)
-            except Exception:
-                return None
+    # 從今天往前找，最多7個日曆日，取最近3個有資料的交易日
+    fetched = []
+    for delta in range(0, 8):
+        d = (datetime.now(TW_TZ) - timedelta(days=delta)).strftime("%Y%m%d")
+        label = (datetime.now(TW_TZ) - timedelta(days=delta)).strftime("%m/%d")
+        foreign, sitc = fetch_day(d)
+        if foreign is not None or sitc is not None:
+            fetched.append({"date": label, "foreign": foreign, "sitc": sitc})
+            if len(fetched) >= 3:
+                break
 
-        # 濾掉非日期列（如合計），只保留含「/」的日期列
-        valid = [row for row in rows if row and "/" in str(row[0]) and len(row) > SITC_IDX]
-        recent = valid[-3:]  # 最近3個交易日
+    if not fetched:
+        return result
 
-        f_vals = [parse_yi(row[FOREIGN_IDX]) for row in recent]
-        s_vals = [parse_yi(row[SITC_IDX])    for row in recent]
-        f_vals = [v for v in f_vals if v is not None]
-        s_vals = [v for v in s_vals if v is not None]
+    result["foreign_net_1d"] = fetched[0]["foreign"]
+    result["sitc_net_1d"]    = fetched[0]["sitc"]
 
-        if f_vals:
-            result["foreign_net_1d"] = f_vals[-1]
-            result["foreign_net_3d"] = round(sum(f_vals), 2)
-        if s_vals:
-            result["sitc_net_1d"] = s_vals[-1]
-            result["sitc_net_3d"] = round(sum(s_vals), 2)
+    f_vals = [row["foreign"] for row in fetched if row["foreign"] is not None]
+    s_vals = [row["sitc"]    for row in fetched if row["sitc"]    is not None]
+    if f_vals:
+        result["foreign_net_3d"] = round(sum(f_vals), 2)
+    if s_vals:
+        result["sitc_net_3d"] = round(sum(s_vals), 2)
 
-        for row in recent:
-            result["display_rows"].append({
-                "date":    row[0],
-                "foreign": parse_yi(row[FOREIGN_IDX]),
-                "sitc":    parse_yi(row[SITC_IDX]),
-            })
-    except Exception:
-        pass
+    result["display_rows"] = fetched
     return result
 
 
