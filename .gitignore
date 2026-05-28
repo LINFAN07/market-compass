@@ -1,0 +1,16 @@
+# 環境與機密
+.env
+*.db
+
+# 除錯用暫存檔
+_*.txt
+_*.html
+_*.json
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# 編輯器
+.vscode/

@@ -2,6 +2,8 @@ streamlit
 yfinance
 requests
 pandas
+numpy
 plotly
 pytz
 streamlit-autorefresh
+beautifulsoup4
