@@ -839,32 +839,34 @@ def main():
 
 融資維持率無法直接取得，改用金額變動方向近似。
 """)
-            if tw_chips:
-                # 外資淨部位
-                oi = tw_chips.get("foreign_net_oi")
-                ch = tw_chips.get("foreign_3d_change")
-                if oi is not None:
-                    oi_label = f"淨空 {abs(oi):,} 口" if oi < 0 else f"淨多 {oi:,} 口"
-                    oi_color = "#ef4444" if oi < -30000 else ("#22c55e" if oi > 0 else "#f97316")
-                    st.metric("外資臺指期淨部位", oi_label)
-                    if oi < -30000:
-                        st.error(f"⚠️ 外資淨空超過 30,000 口（{oi:,} 口），強烈看空警示")
-                    elif oi > 0:
-                        st.success("外資偏多方，籌碼面支撐")
+            _tab1, _tab2, _tab3 = st.tabs(["外資期貨", "三大法人", "融資餘額"])
+
+            # ── tab1：外資臺指期 ──
+            with _tab1:
+                if tw_chips:
+                    oi = tw_chips.get("foreign_net_oi")
+                    ch = tw_chips.get("foreign_3d_change")
+                    if oi is not None:
+                        oi_label = f"淨空 {abs(oi):,} 口" if oi < 0 else f"淨多 {oi:,} 口"
+                        st.metric("外資臺指期淨部位", oi_label)
+                        if oi < -30000:
+                            st.error(f"⚠️ 外資淨空超過 30,000 口（{oi:,} 口），強烈看空警示")
+                        elif oi > 0:
+                            st.success("外資偏多方，籌碼面支撐")
+                        else:
+                            st.info(f"外資小幅淨空（{oi:,} 口），尚未達警戒門檻")
+                        if ch is not None:
+                            ch_label = f"+{ch:,} 口（回補）" if ch > 0 else f"{ch:,} 口（加空）"
+                            st.metric("近3日累計變動", ch_label)
+                            if ch > 10000:
+                                st.success("外資近3日大幅回補，態度轉向，與HV20共振可加倉")
                     else:
-                        st.info(f"外資小幅淨空（{oi:,} 口），尚未達警戒門檻")
-
-                    if ch is not None:
-                        ch_label = f"+{ch:,} 口（回補）" if ch > 0 else f"{ch:,} 口（加空）"
-                        st.metric("近3日累計變動", ch_label)
-                        if ch > 10000:
-                            st.success("外資近3日大幅回補，態度轉向，與HV20共振可加倉")
+                        st.warning("外資期貨資料暫時無法取得（TAIFEX 連線問題）")
                 else:
-                    st.warning("外資期貨資料暫時無法取得（TAIFEX 連線問題）")
+                    st.error("籌碼資料載入失敗")
 
-                # 三大法人現股買賣超
-                st.divider()
-                st.caption("💹 三大法人現股（TWSE BFI82U）")
+            # ── tab2：三大法人現股 ──
+            with _tab2:
                 if tw_inst_cash:
                     f1 = tw_inst_cash.get("foreign_net_1d")
                     f3 = tw_inst_cash.get("foreign_net_3d")
@@ -906,9 +908,8 @@ def main():
                 else:
                     st.warning("三大法人現股資料暫時無法取得（TWSE 連線問題）")
 
-                # 融資餘額趨勢
-                st.divider()
-                st.caption("📉 融資餘額（⚠️代理維持率方向）")
+            # ── tab3：融資餘額 ──
+            with _tab3:
                 if tw_margin:
                     chg = tw_margin["chg_pct"]
                     bal = tw_margin["latest"]
@@ -929,8 +930,6 @@ def main():
                     st.plotly_chart(fig, use_container_width=True)
                 else:
                     st.info("融資餘額歷史資料暫無法取得")
-            else:
-                st.error("籌碼資料載入失敗")
 
         # ── 市場廣度：TAIEX vs OTC ──
         with tc3:
