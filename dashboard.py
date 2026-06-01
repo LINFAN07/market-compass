@@ -10,6 +10,7 @@ import pandas as pd
 import plotly.graph_objects as go
 from bs4 import BeautifulSoup
 from datetime import datetime, timedelta
+import re
 import pytz
 from streamlit_autorefresh import st_autorefresh
 
@@ -284,14 +285,16 @@ def get_tw_chips():
 
 @st.cache_data(ttl=28800, show_spinner=False)
 def get_tw_margin_history():
-    """融資餘額歷史（TWSE MI_MARGN，近20個交易日）
+    """融資 + 融券餘額歷史（TWSE MI_MARGN，近20個交易日）
 
-    MI_MARGN 格式：tables[0]["data"] 每列一個類別，最後列為全市場合計，
-    最後欄為今日餘額（仟元）。用 date=YYYYMMDD 逐日查詢。
+    MI_MARGN 格式：
+    - tables[0]：融資統計，最後列合計，最後欄 = 融資餘額（仟元）
+    - tables[1]：融券統計，最後列合計，「餘額金額」欄 = 融券餘額（仟元）
+    同一次請求同時取兩個表，避免重複呼叫 API。
     """
 
-    def fetch_balance(date_str):
-        """查單日全市場融資餘額（仟元）→ 億元；無資料回傳 None"""
+    def fetch_both(date_str):
+        """查單日融資 + 融券餘額（仟元 → 億元）；無資料回傳 (None, None)"""
         try:
             r = requests.get(
                 f"https://www.twse.com.tw/rwd/zh/marginTrading/MI_MARGN?date={date_str}&response=json",
@@ -300,45 +303,71 @@ def get_tw_margin_history():
             )
             data = r.json()
             if data.get("stat") != "OK":
-                return None
+                return None, None
             tables = data.get("tables", [])
-            if not tables:
-                return None
-            rows = tables[0].get("data", [])
-            if not rows:
-                return None
-            # 最後一列 = 全市場合計；最後一欄 = 今日餘額（仟元）
-            bal = int(str(rows[-1][-1]).replace(",", ""))
-            return round(bal / 100000, 2)  # 仟元 → 億元（÷100,000）
+
+            # 融資：tables[0] 最後列最後欄 = 融資餘額（仟元）
+            margin_bal = None
+            if tables:
+                rows = tables[0].get("data", [])
+                if rows:
+                    margin_bal = round(int(str(rows[-1][-1]).replace(",", "")) / 100000, 2)
+
+            # 融券：tables[1] 最後列，尋找「餘額金額」欄位；找不到用倒數第2欄
+            short_bal = None
+            if len(tables) >= 2:
+                tbl = tables[1]
+                rows = tbl.get("data", [])
+                if rows:
+                    fields = tbl.get("fields", [])
+                    col = next((i for i, f in enumerate(fields) if "餘額金額" in str(f)), -2)
+                    short_bal = round(int(str(rows[-1][col]).replace(",", "")) / 100000, 2)
+
+            return margin_bal, short_bal
         except Exception:
-            return None
+            return None, None
 
     # 往前找最多 30 個日曆日，取最近 20 個有效交易日
-    history = {}
+    margin_history, short_history = {}, {}
     for delta in range(0, 31):
         d = datetime.now(TW_TZ) - timedelta(days=delta)
-        bal = fetch_balance(d.strftime("%Y%m%d"))
-        if bal is not None:
-            history[d.strftime("%m/%d")] = bal
-            if len(history) >= 20:
-                break
+        label = d.strftime("%m/%d")
+        m_bal, s_bal = fetch_both(d.strftime("%Y%m%d"))
+        if m_bal is not None:
+            margin_history[label] = m_bal
+        if s_bal is not None:
+            short_history[label] = s_bal
+        if len(margin_history) >= 20 and len(short_history) >= 20:
+            break
 
-    if not history:
+    if not margin_history:
         return None
 
-    # 轉成 Series（由舊到新排列）
-    series = pd.Series(dict(reversed(list(history.items()))))
-
+    # 融資 Series（由舊到新）
+    margin_series = pd.Series(dict(reversed(list(margin_history.items()))))
     chg_pct = None
-    if len(series) >= 2:
-        t, p = float(series.iloc[-1]), float(series.iloc[-2])
+    if len(margin_series) >= 2:
+        t, p = float(margin_series.iloc[-1]), float(margin_series.iloc[-2])
         if p > 0:
             chg_pct = round((t / p - 1) * 100, 3)
 
+    # 融券 Series + 5日變動
+    short_series, short_chg_5d, short_latest = None, None, None
+    if short_history:
+        short_series = pd.Series(dict(reversed(list(short_history.items()))))
+        short_latest = round(float(short_series.iloc[-1]), 0)
+        if len(short_series) >= 6:
+            t5, p5 = float(short_series.iloc[-1]), float(short_series.iloc[-5])
+            if p5 > 0:
+                short_chg_5d = round((t5 / p5 - 1) * 100, 2)
+
     return {
-        "series":  series,
-        "chg_pct": chg_pct,
-        "latest":  round(float(series.iloc[-1]), 0),
+        "series":       margin_series,
+        "chg_pct":      chg_pct,
+        "latest":       round(float(margin_series.iloc[-1]), 0),
+        "short_series": short_series,   # 融券餘額歷史
+        "short_latest": short_latest,   # 融券最新值（億元）
+        "short_chg_5d": short_chg_5d,  # 融券近5日變動%（逆向指標）
     }
 
 
@@ -417,7 +446,12 @@ def get_tw_institutional_cash():
 
 @st.cache_data(ttl=28800, show_spinner=False)
 def get_tw_market_breadth():
-    """台股市場廣度：^TWII（加權）vs ^TWOII（櫃買）"""
+    """台股市場廣度：^TWII（加權）vs ^TWOII（櫃買）vs 2330.TW（台積電）
+
+    台積電佔加權指數約 30%，其相對強弱補足 OTC vs TAIEX 的盲點：
+    若加權漲但台積電大幅落後，代表廣度問題比 OTC 數字顯示的更嚴重。
+    2330.TW 資料抓取失敗不影響主要廣度計算。
+    """
     try:
         frames = {}
         for s in ["^TWII", "^TWOII"]:
@@ -427,18 +461,44 @@ def get_tw_market_breadth():
         df = pd.DataFrame(frames).dropna()
         if len(df) < 6:
             return None
+
+        # 台積電單獨抓取，失敗不影響主要指標
+        try:
+            h_tsmc = yf.Ticker("2330.TW").history(period="3mo")["Close"].dropna()
+            h_tsmc.index = h_tsmc.index.tz_localize(None)
+            # 只取與主表對齊的日期
+            h_tsmc = h_tsmc.reindex(df.index)
+            df["2330.TW"] = h_tsmc
+        except Exception:
+            pass
+
         norm = (df / df.iloc[0]) * 100
         taiex_5d = (df["^TWII"].iloc[-1]  / df["^TWII"].iloc[-5]  - 1) * 100
         otc_5d   = (df["^TWOII"].iloc[-1] / df["^TWOII"].iloc[-5] - 1) * 100
-        taiex_3d = (df["^TWII"].iloc[-1]  / df["^TWII"].iloc[-3]  - 1) * 100  # 危機判定用
+        taiex_3d = (df["^TWII"].iloc[-1]  / df["^TWII"].iloc[-3]  - 1) * 100
+
+        # 台積電相對強弱（可能為 None）
+        tsmc_cur = tsmc_chg_pct = tsmc_vs_taiex_5d = None
+        if "2330.TW" in df.columns:
+            tsmc_series = df["2330.TW"].dropna()
+            if len(tsmc_series) >= 6:
+                tsmc_cur       = round(float(tsmc_series.iloc[-1]), 0)
+                tsmc_chg_pct   = round((float(tsmc_series.iloc[-1]) / float(tsmc_series.iloc[-2]) - 1) * 100, 2)
+                tsmc_5d        = (float(tsmc_series.iloc[-1]) / float(tsmc_series.iloc[-5]) - 1) * 100
+                tsmc_vs_taiex_5d = round(tsmc_5d - taiex_5d, 2)
+
         return {
-            "normalized":      norm.tail(60),
-            "taiex_cur":       round(float(df["^TWII"].iloc[-1]), 0),
-            "taiex_chg_pct":   round((float(df["^TWII"].iloc[-1])  / float(df["^TWII"].iloc[-2])  - 1) * 100, 2),
-            "otc_cur":         round(float(df["^TWOII"].iloc[-1]), 2),
-            "otc_chg_pct":     round((float(df["^TWOII"].iloc[-1]) / float(df["^TWOII"].iloc[-2]) - 1) * 100, 2),
-            "otc_vs_taiex_5d": round(otc_5d - taiex_5d, 2),
-            "taiex_3d":        round(taiex_3d, 2),
+            "normalized":        norm[["^TWII", "^TWOII"]].tail(60),
+            "tsmc_normalized":   norm["2330.TW"].tail(60) if "2330.TW" in norm.columns else None,
+            "taiex_cur":         round(float(df["^TWII"].iloc[-1]), 0),
+            "taiex_chg_pct":     round((float(df["^TWII"].iloc[-1])  / float(df["^TWII"].iloc[-2])  - 1) * 100, 2),
+            "otc_cur":           round(float(df["^TWOII"].iloc[-1]), 2),
+            "otc_chg_pct":       round((float(df["^TWOII"].iloc[-1]) / float(df["^TWOII"].iloc[-2]) - 1) * 100, 2),
+            "otc_vs_taiex_5d":   round(otc_5d - taiex_5d, 2),
+            "taiex_3d":          round(taiex_3d, 2),
+            "tsmc_cur":          tsmc_cur,
+            "tsmc_chg_pct":      tsmc_chg_pct,
+            "tsmc_vs_taiex_5d":  tsmc_vs_taiex_5d,
         }
     except Exception:
         return None
@@ -492,6 +552,140 @@ def get_tw_cross_assets():
             "dxy_cur":       round(float(df["DX-Y.NYB"].iloc[-1]), 2),
             "dxy_chg_pct":   round((float(df["DX-Y.NYB"].iloc[-1]) / float(df["DX-Y.NYB"].iloc[-2]) - 1) * 100, 2),
             "dxy_5d":        round(dxy_5d, 2),
+        }
+    except Exception:
+        return None
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def get_tw_macro_indicators():
+    """景氣對策信號燈（國發會，月更）"""
+    LIGHT_INFO = {
+        1: ("紅燈",   "景氣過熱", "#ef4444"),
+        2: ("黃紅燈", "景氣趨熱", "#f97316"),
+        3: ("綠燈",   "景氣穩定", "#22c55e"),
+        4: ("黃藍燈", "景氣趨緩", "#eab308"),
+        5: ("藍燈",   "景氣衰退", "#3b82f6"),
+    }
+    def score_to_light(s):
+        if s <= 16: return 5
+        if s <= 22: return 4
+        if s <= 31: return 3
+        if s <= 37: return 2
+        return 1
+
+    try:
+        session = requests.Session()
+        hdrs = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+        r = session.get("https://index.ndc.gov.tw/n/zh_tw", headers=hdrs, timeout=10)
+        m = re.search(r'<meta name="csrf-token" content="([^"]+)"', r.text)
+        if not m:
+            return None
+        csrf = m.group(1)
+        post_hdrs = {**hdrs, "X-CSRF-TOKEN": csrf,
+                     "X-Requested-With": "XMLHttpRequest",
+                     "Content-Type": "application/json",
+                     "Referer": "https://index.ndc.gov.tw/n/zh_tw"}
+        r2 = session.post("https://index.ndc.gov.tw/n/json/lightscore",
+                          headers=post_hdrs, timeout=10)
+        data = r2.json()
+        line_data = data.get("line", [])
+        if not line_data:
+            return None
+        latest   = line_data[-1]
+        score    = latest["y"]
+        x        = latest["x"]
+        month    = f"{x[:4]}-{x[4:]}"
+        light_n  = score_to_light(score)
+        name, desc, color = LIGHT_INFO[light_n]
+        months  = [f"{d['x'][:4]}-{d['x'][4:]}" for d in line_data]
+        scores  = [d["y"] for d in line_data]
+        history = pd.Series(scores, index=pd.to_datetime(months))
+        return {
+            "month": month, "score": score,
+            "light_name": name, "light_desc": desc, "light_color": color,
+            "history": history, "next_release": data.get("next", ""),
+        }
+    except Exception:
+        return None
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def get_tw_pmi():
+    """台灣製造業 PMI（國發會，月更）"""
+    try:
+        session = requests.Session()
+        hdrs = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+        r = session.get("https://index.ndc.gov.tw/n/zh_tw/PMI", headers=hdrs, timeout=10)
+        m = re.search(r'<meta name="csrf-token" content="([^"]+)"', r.text)
+        if not m:
+            return None
+        csrf = m.group(1)
+        post_hdrs = {**hdrs, "X-CSRF-TOKEN": csrf,
+                     "X-Requested-With": "XMLHttpRequest",
+                     "Content-Type": "application/json",
+                     "Referer": "https://index.ndc.gov.tw/n/zh_tw/PMI"}
+        r2 = session.post("https://index.ndc.gov.tw/n/json/PMI",
+                          headers=post_hdrs, timeout=10)
+        data = r2.json()
+        # key "55" = 製造業PMI(季調值)
+        pmi_d = data.get("right", {}).get("55", {}).get("d", [])
+        if not pmi_d:
+            return None
+        latest  = pmi_d[-1]
+        value   = latest["n"]
+        x       = latest["m"]
+        month   = f"{x[:4]}-{x[4:]}"
+        prev    = pmi_d[-2]["n"] if len(pmi_d) >= 2 else None
+        change  = round(value - prev, 1) if prev is not None else None
+        expanding = value >= 50
+        color   = "#22c55e" if expanding else "#ef4444"
+        status  = "擴張" if expanding else "收縮"
+        return {
+            "value": value, "month": month, "prev": prev,
+            "change": change, "status": status, "color": color,
+            "next_release": data.get("next", ""),
+        }
+    except Exception:
+        return None
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def get_tw_export_orders():
+    """電子產品外銷訂單年增率（經濟部，月更）"""
+    try:
+        from io import StringIO
+        hdrs = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+        r = requests.get("https://service.moea.gov.tw/EE521/common/Common.aspx?code=B&no=9",
+                         headers=hdrs, timeout=10)
+        tables = pd.read_html(StringIO(r.text))
+        df = tables[0]
+        df.columns = ["year", "month_raw", "total", "cn_hk", "us", "eu", "jp", "other", "_"]
+        df["year"] = df["year"].ffill()
+        # 去掉 NaN 與累計行（月份含 -，如「1-4月」）
+        df2 = df.dropna(subset=["total"])
+        df2 = df2[~df2["month_raw"].astype(str).str.contains(r"-\d", na=False)]
+        df2 = df2.copy()
+        df2["roc"] = df2["year"].apply(
+            lambda x: int(re.findall(r"\d+", str(x))[0]) if re.findall(r"\d+", str(x)) else None)
+        df2["mon"] = df2["month_raw"].apply(
+            lambda x: int(re.findall(r"\d+", str(x))[0]) if re.findall(r"\d+", str(x)) else None)
+        df2["val"] = pd.to_numeric(
+            df2["total"].astype(str).str.replace(r"\s+", "", regex=True), errors="coerce")
+        df2 = df2.dropna(subset=["roc", "mon", "val"])
+        if df2.empty:
+            return None
+        last = df2.iloc[-1]
+        ad_year  = int(last["roc"]) + 1911
+        month    = f"{ad_year}-{int(last['mon']):02d}"
+        value    = float(last["val"])
+        # 12 個月歷史
+        history_dates = [f"{int(r)+1911}-{int(m):02d}" for r, m in zip(df2["roc"], df2["mon"])]
+        history = pd.Series(df2["val"].values, index=pd.to_datetime(history_dates))
+        color   = "#22c55e" if value >= 0 else "#ef4444"
+        return {
+            "value": round(value, 1), "month": month,
+            "history": history.tail(12), "color": color,
         }
     except Exception:
         return None
@@ -599,6 +793,8 @@ def calc_tw_recommendation(
     taiex_3d,
     foreign_cash_3d=None,
     sitc_3d=None,
+    short_chg_5d=None,
+    tsmc_vs_taiex_5d=None,
 ):
     """台股綜合評分 → 加倉/觀望/減倉建議"""
     score, crisis = 0, False
@@ -624,6 +820,10 @@ def calc_tw_recommendation(
         elif margin_chg_pct > 0.5:
             score -= 1
 
+    # ── 融券餘額（逆向指標：空方過擠 → 潛在軋空）──
+    if short_chg_5d is not None and short_chg_5d > 3:
+        score += 1
+
     # ── 外資期貨淨部位 ──
     if foreign_net_oi is not None and foreign_net_oi < -30000:
         score -= 2
@@ -636,6 +836,13 @@ def calc_tw_recommendation(
             score += 1
         elif otc_vs_taiex_5d < -1.5:
             score -= 1
+
+    # ── 台積電相對強弱（廣度升級：最大權值股方向確認）──
+    if tsmc_vs_taiex_5d is not None:
+        if tsmc_vs_taiex_5d > 2:
+            score += 1   # 台積電領漲，半導體訊號確認
+        elif tsmc_vs_taiex_5d < -2:
+            score -= 1   # 台積電落後，最大權值股轉弱
 
     # ── 資金流動性：台幣匯率（正值=台幣貶）──
     if twd_5d is not None:
@@ -738,6 +945,269 @@ def main():
             tw_breadth    = get_tw_market_breadth()
             tw_credit     = get_tw_credit()
             tw_cross      = get_tw_cross_assets()
+            tw_macro      = get_tw_macro_indicators()
+            tw_pmi        = get_tw_pmi()
+            tw_exports    = get_tw_export_orders()
+
+        # ── 提前計算短線信號（供宏觀背離矩陣使用）──
+        tw_rec_label, tw_rec_color, tw_rec_desc = calc_tw_recommendation(
+            hv20              = tw_vix["hv20"]          if tw_vix    else None,
+            hv20_falling      = tw_vix["falling"]        if tw_vix    else False,
+            foreign_net_oi    = tw_chips.get("foreign_net_oi")    if tw_chips  else None,
+            foreign_3d_change = tw_chips.get("foreign_3d_change") if tw_chips  else None,
+            margin_chg_pct    = tw_margin["chg_pct"] if tw_margin else None,
+            otc_vs_taiex_5d   = tw_breadth["otc_vs_taiex_5d"]     if tw_breadth else None,
+            twd_5d            = tw_credit["twd_5d"]      if tw_credit else None,
+            twd_3d            = tw_credit["twd_3d"]      if tw_credit else None,
+            sox_below_ma60    = tw_cross["sox_below_ma60"] if tw_cross else False,
+            dxy_5d            = tw_cross["dxy_5d"]        if tw_cross else None,
+            taiex_3d          = tw_breadth["taiex_3d"]    if tw_breadth else None,
+            foreign_cash_3d   = tw_inst_cash.get("foreign_net_3d") if tw_inst_cash else None,
+            sitc_3d           = tw_inst_cash.get("sitc_net_3d")    if tw_inst_cash else None,
+            short_chg_5d      = tw_margin.get("short_chg_5d")      if tw_margin  else None,
+            tsmc_vs_taiex_5d  = tw_breadth.get("tsmc_vs_taiex_5d") if tw_breadth else None,
+        )
+
+        # ── 宏觀背景（月更，不影響短線評分）──
+        with st.expander("🌐 宏觀背景（月更指標，不影響短線評分）", expanded=False):
+            st.markdown(
+                "<div style='background:var(--secondary-background-color);border-left:3px solid #888;"
+                "border-radius:8px;padding:9px 16px;margin-bottom:14px;font-size:0.88rem'>"
+                "🕐 <b>宏觀指標為落後指標</b>，市場通常比景氣燈早見底 3–6 個月。"
+                "　宏觀不告訴你「什麼時候買」，而是告訴你「這次下跌可能有多深、需要多久復原」。</div>",
+                unsafe_allow_html=True,
+            )
+
+            # ── 三欄指標卡片 ──
+            mc1, mc2, mc3 = st.columns(3)
+
+            # 景氣燈（自動抓取）
+            with mc1:
+                if tw_macro:
+                    c = tw_macro["light_color"]
+                    st.markdown(
+                        f"<div style='background:var(--secondary-background-color);border-left:4px solid {c};"
+                        f"border-radius:8px;padding:12px 16px'>"
+                        f"<div style='color:{c};font-weight:bold;font-size:0.82rem;margin-bottom:6px'>🔦 景氣對策信號燈</div>"
+                        f"<div style='font-size:2rem;font-weight:bold;line-height:1.1'>{tw_macro['score']}"
+                        f"<span style='font-size:0.95rem;opacity:0.55'> 分</span></div>"
+                        f"<div style='color:{c};font-size:0.9rem;font-weight:600;margin:4px 0'>"
+                        f"{tw_macro['light_name']} · {tw_macro['light_desc']}</div>"
+                        f"<div style='font-size:0.75rem;opacity:0.5'>最新月份：{tw_macro['month']}</div></div>",
+                        unsafe_allow_html=True,
+                    )
+                    # 12 個月折線趨勢
+                    fig_macro = go.Figure()
+                    fig_macro.add_trace(go.Scatter(
+                        x=tw_macro["history"].index, y=tw_macro["history"].values,
+                        mode="lines+markers", line=dict(color=c, width=2),
+                        marker=dict(size=4),
+                    ))
+                    for y_val, y_c, y_lbl in [(37, "#ef4444", "37"), (31, "#22c55e", "31"), (22, "#3b82f6", "22")]:
+                        fig_macro.add_hline(y=y_val, line_dash="dot", line_color=y_c,
+                                            annotation_text=y_lbl, annotation_font_size=9)
+                    fig_macro.update_layout(
+                        height=130, margin=dict(l=2, r=2, t=6, b=2),
+                        paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+                        showlegend=False,
+                        xaxis=dict(gridcolor="rgba(128,128,128,0.2)", tickformat="%m/%y",
+                                   showticklabels=True, tickfont=dict(size=9)),
+                        yaxis=dict(gridcolor="rgba(128,128,128,0.2)", range=[0, 50],
+                                   tickfont=dict(size=9)),
+                    )
+                    st.plotly_chart(fig_macro, use_container_width=True)
+                else:
+                    st.markdown(
+                        "<div style='background:var(--secondary-background-color);border-left:4px solid #888;"
+                        "border-radius:8px;padding:12px 16px'>"
+                        "<div style='font-weight:bold;font-size:0.82rem;margin-bottom:6px'>🔦 景氣對策信號燈</div>"
+                        "<div style='font-size:0.85rem;opacity:0.55'>資料取得失敗，請手動查詢</div></div>",
+                        unsafe_allow_html=True,
+                    )
+                    st.link_button("前往國發會景氣指標", "https://index.ndc.gov.tw/n/zh_tw")
+
+            # PMI（自動抓取）
+            with mc2:
+                if tw_pmi:
+                    c_pmi = tw_pmi["color"]
+                    chg_txt = (f"{'↑' if tw_pmi['change'] >= 0 else '↓'} {abs(tw_pmi['change']):.1f}"
+                               if tw_pmi["change"] is not None else "")
+                    st.markdown(
+                        f"<div style='background:var(--secondary-background-color);border-left:4px solid {c_pmi};"
+                        f"border-radius:8px;padding:12px 16px'>"
+                        f"<div style='color:{c_pmi};font-weight:bold;font-size:0.82rem;margin-bottom:6px'>📊 台灣製造業 PMI</div>"
+                        f"<div style='font-size:2rem;font-weight:bold;line-height:1.1'>{tw_pmi['value']}"
+                        f"<span style='font-size:0.95rem;opacity:0.55'> 點</span></div>"
+                        f"<div style='color:{c_pmi};font-size:0.9rem;font-weight:600;margin:4px 0'>"
+                        f"{tw_pmi['status']} {'（高於 50）' if tw_pmi['value'] >= 50 else '（低於 50）'}</div>"
+                        f"<div style='font-size:0.78rem;opacity:0.55'>"
+                        f"較上月 {chg_txt} &nbsp;·&nbsp; {tw_pmi['month']}</div></div>",
+                        unsafe_allow_html=True,
+                    )
+                    st.markdown(
+                        "<div style='font-size:0.72rem;opacity:0.45;margin-top:6px;padding:0 4px'>"
+                        "來源：國發會（S&P Global 季調）·&nbsp;"
+                        f"下次發布：{tw_pmi['next_release'][:10] if tw_pmi['next_release'] else '—'}</div>",
+                        unsafe_allow_html=True,
+                    )
+                else:
+                    st.markdown(
+                        "<div style='background:var(--secondary-background-color);border-left:4px solid #888;"
+                        "border-radius:8px;padding:12px 16px'>"
+                        "<div style='font-weight:bold;font-size:0.82rem;margin-bottom:6px'>📊 台灣製造業 PMI</div>"
+                        "<div style='font-size:0.85rem;opacity:0.55'>資料取得失敗，請手動查詢</div></div>",
+                        unsafe_allow_html=True,
+                    )
+                    st.link_button("前往國發會 PMI 頁", "https://index.ndc.gov.tw/n/zh_tw/PMI")
+
+            # 外銷訂單（自動抓取）
+            with mc3:
+                if tw_exports:
+                    c_exp = tw_exports["color"]
+                    sign = "+" if tw_exports["value"] >= 0 else ""
+                    st.markdown(
+                        f"<div style='background:var(--secondary-background-color);border-left:4px solid {c_exp};"
+                        f"border-radius:8px;padding:12px 16px'>"
+                        f"<div style='color:{c_exp};font-weight:bold;font-size:0.82rem;margin-bottom:6px'>📦 電子產品外銷訂單年增率</div>"
+                        f"<div style='font-size:2rem;font-weight:bold;line-height:1.1'>{sign}{tw_exports['value']}"
+                        f"<span style='font-size:0.95rem;opacity:0.55'> %</span></div>"
+                        f"<div style='color:{c_exp};font-size:0.9rem;font-weight:600;margin:4px 0'>"
+                        f"{'年增' if tw_exports['value'] >= 0 else '年減'} · 半導體庫存循環指標</div>"
+                        f"<div style='font-size:0.75rem;opacity:0.5'>最新月份：{tw_exports['month']}</div></div>",
+                        unsafe_allow_html=True,
+                    )
+                    fig_exp = go.Figure()
+                    fig_exp.add_trace(go.Bar(
+                        x=tw_exports["history"].index,
+                        y=tw_exports["history"].values,
+                        marker_color=[c_exp if v >= 0 else "#ef4444"
+                                      for v in tw_exports["history"].values],
+                    ))
+                    fig_exp.add_hline(y=0, line_color="rgba(128,128,128,0.5)", line_width=1)
+                    fig_exp.update_layout(
+                        height=130, margin=dict(l=2, r=2, t=6, b=2),
+                        paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+                        showlegend=False,
+                        xaxis=dict(gridcolor="rgba(128,128,128,0.15)", tickformat="%m/%y",
+                                   tickfont=dict(size=9)),
+                        yaxis=dict(gridcolor="rgba(128,128,128,0.15)", tickfont=dict(size=9)),
+                    )
+                    st.plotly_chart(fig_exp, use_container_width=True)
+                else:
+                    st.markdown(
+                        "<div style='background:var(--secondary-background-color);border-left:4px solid #888;"
+                        "border-radius:8px;padding:12px 16px'>"
+                        "<div style='font-weight:bold;font-size:0.82rem;margin-bottom:6px'>📦 電子產品外銷訂單年增率</div>"
+                        "<div style='font-size:0.85rem;opacity:0.55'>資料取得失敗，請手動查詢</div></div>",
+                        unsafe_allow_html=True,
+                    )
+                    st.link_button("前往經濟部統計處", "https://service.moea.gov.tw/EE521/common/Common.aspx?code=B&no=9")
+
+            # ── 背離解讀 2×2 矩陣（自動判斷當前象限）──
+            _macro_bullish = (
+                tw_macro is not None and
+                tw_macro["light_name"] in ("紅燈", "黃紅燈", "綠燈")
+            )
+            _macro_known = tw_macro is not None
+            _short_is_buy = "加倉" in tw_rec_label
+            _short_is_caution = any(k in tw_rec_label for k in ("謹慎", "減倉", "危機"))
+
+            # 判斷四格中哪格 active：(宏觀樂觀?, 短線買?)
+            if _macro_known and _short_is_buy:
+                _active_cell = (_macro_bullish, True)
+            elif _macro_known and _short_is_caution:
+                _active_cell = (_macro_bullish, False)
+            else:
+                _active_cell = None  # 觀望或宏觀未知
+
+            # 狀態橫幅
+            _QUADRANT_NAMES = {
+                (True,  True):  "✅ 最強買點",
+                (False, True):  "⚡ 真實機會，需更高容忍度",
+                (True,  False): "📈 健康修正",
+                (False, False): "🛡️ 雙重警示",
+            }
+            if _active_cell is not None:
+                _macro_str = "宏觀樂觀" if _macro_bullish else "宏觀悲觀"
+                _short_str = "短線加倉" if _short_is_buy else "短線謹慎"
+                _q_name    = _QUADRANT_NAMES[_active_cell]
+                _banner_html = (
+                    f"<div style='background:var(--secondary-background-color);border-left:3px solid #6366f1;"
+                    f"border-radius:8px;padding:8px 14px;margin:12px 0 8px;font-size:0.85rem'>"
+                    f"<b>▶ 當前象限</b>：{_macro_str}（{tw_macro['light_name']}）× {_short_str}（{tw_rec_label}）"
+                    f"→ <b>{_q_name}</b></div>"
+                )
+            else:
+                _short_txt = "短線信號觀望" if _macro_known else "宏觀數據未取得"
+                _banner_html = (
+                    f"<div style='background:var(--secondary-background-color);border-left:3px solid #94a3b8;"
+                    f"border-radius:8px;padding:8px 14px;margin:12px 0 8px;font-size:0.85rem;opacity:0.7'>"
+                    f"目前 {_short_txt}，不落入特定象限</div>"
+                )
+            st.markdown(
+                "<div style='margin:16px 0 4px;font-weight:bold;font-size:0.9rem'>宏觀與短線背離解讀</div>",
+                unsafe_allow_html=True,
+            )
+            st.markdown(_banner_html, unsafe_allow_html=True)
+
+            def _quad_card(is_active, bg_rgba_base, border_color_hex, label, title_color, title_text, body_text):
+                """回傳背離矩陣格子 HTML；active 格子加重顯示"""
+                if is_active:
+                    bg      = bg_rgba_base.replace("0.15", "0.30")
+                    border  = f"2px solid {border_color_hex}"
+                    badge   = (f"<span style='float:right;background:{border_color_hex};color:#fff;"
+                               f"font-size:0.62rem;padding:2px 7px;border-radius:10px;font-weight:bold;margin-top:1px'>"
+                               f"▶ 當前</span>")
+                    dim     = ""
+                else:
+                    bg      = bg_rgba_base
+                    border  = f"1px solid {border_color_hex}66"
+                    badge   = ""
+                    dim     = "opacity:0.4;"
+                return (
+                    f"<div style='{dim}background:{bg};border:{border};"
+                    f"border-radius:8px;padding:12px'>"
+                    f"<div style='font-size:0.72rem;opacity:0.55;margin-bottom:4px'>{label}{badge}</div>"
+                    f"<div style='color:{title_color};font-weight:bold;font-size:0.9rem'>{title_text}</div>"
+                    f"<div style='font-size:0.8rem;margin-top:5px'>{body_text}</div></div>"
+                )
+
+            d1, d2 = st.columns(2)
+            d3, d4 = st.columns(2)
+            with d1:
+                st.markdown(_quad_card(
+                    _active_cell == (True, True),
+                    "rgba(34,197,94,0.15)", "#16a34a",
+                    "宏觀樂觀 × 短線加倉", "#16a34a",
+                    "✅ 最強買點", "牛市回調，可積極執行 3-3-4 策略",
+                ), unsafe_allow_html=True)
+            with d2:
+                st.markdown(_quad_card(
+                    _active_cell == (False, True),
+                    "rgba(249,115,22,0.15)", "#c2410c",
+                    "宏觀悲觀 × 短線加倉", "#c2410c",
+                    "⚡ 真實機會，需更高容忍度",
+                    "宏觀底部最悲觀，但市場已領先 3–6 個月。可買，但回調更深、復原更慢",
+                ), unsafe_allow_html=True)
+            with d3:
+                st.markdown(_quad_card(
+                    _active_cell == (True, False),
+                    "rgba(234,179,8,0.15)", "#a16207",
+                    "宏觀樂觀 × 短線謹慎", "#a16207",
+                    "📈 健康修正", "牛市中的健康回調，可比平時更積極執行",
+                ), unsafe_allow_html=True)
+            with d4:
+                st.markdown(_quad_card(
+                    _active_cell == (False, False),
+                    "rgba(239,68,68,0.15)", "#b91c1c",
+                    "宏觀悲觀 × 短線謹慎", "#b91c1c",
+                    "🛡️ 雙重警示", "保持防禦，縮短操作週期",
+                ), unsafe_allow_html=True)
+            st.markdown(
+                "<div style='font-size:0.78rem;opacity:0.5;margin-top:10px'>"
+                "💡 宏觀影響你的「心理準備」與「等待時長」，不影響短線評分的進出場方向。</div>",
+                unsafe_allow_html=True,
+            )
 
         # ────────────────────────────────────────────────────
         # 第一行：HV20 波動率 / 籌碼面 / 市場廣度
@@ -838,6 +1308,14 @@ def main():
 | 單日增加 > 0.5% | -1（槓桿持續上升） |
 
 融資維持率無法直接取得，改用金額變動方向近似。
+
+**融券餘額（逆向指標）**（來源：TWSE，同 MI_MARGN）
+
+| 條件 | 評分 |
+|------|------|
+| 近5日增加 > 3% | +1（空方過擠，潛在軋空） |
+
+融券上升代表空方積極佈局；若同時出現 HV20 恐慌訊號，代表空方過度擠擁，是短線偏多的逆向指標。
 """)
             _tab1, _tab2, _tab3 = st.tabs(["外資期貨", "三大法人", "融資餘額"])
 
@@ -908,9 +1386,10 @@ def main():
                 else:
                     st.warning("三大法人現股資料暫時無法取得（TWSE 連線問題）")
 
-            # ── tab3：融資餘額 ──
+            # ── tab3：融資 + 融券餘額 ──
             with _tab3:
                 if tw_margin:
+                    # 融資餘額
                     chg = tw_margin["chg_pct"]
                     bal = tw_margin["latest"]
                     delta_str = f"{chg:+.3f}%" if chg is not None else ""
@@ -925,13 +1404,39 @@ def main():
                             st.info(f"融資餘額日變動 {chg:+.3f}%，平穩")
                     fig = mini_chart(
                         {"融資餘額（億）": (tw_margin["series"], "#a78bfa")},
-                        height=130,
+                        height=120,
                     )
                     st.plotly_chart(fig, use_container_width=True)
+
+                    # 融券餘額（逆向指標）
+                    st.divider()
+                    st.markdown("**融券餘額（空方籌碼，逆向指標）**")
+                    short_latest = tw_margin.get("short_latest")
+                    short_5d     = tw_margin.get("short_chg_5d")
+                    short_series = tw_margin.get("short_series")
+                    if short_latest is not None:
+                        delta_s = f"近5日 {short_5d:+.2f}%" if short_5d is not None else ""
+                        st.metric("融券餘額（最新）", f"{short_latest:,.0f}億", delta_s,
+                                  help="融券5日漲幅 > 3% 代表空方過擠，是逆向偏多訊號")
+                        if short_5d is not None:
+                            if short_5d > 3:
+                                st.success(f"融券近5日增加 {short_5d:.2f}%，空方過擠，潛在軋空動能（+1）")
+                            elif short_5d < -3:
+                                st.info(f"融券近5日減少 {abs(short_5d):.2f}%，空方快速撤退")
+                            else:
+                                st.info(f"融券近5日變動 {short_5d:+.2f}%，無特殊訊號")
+                        if short_series is not None:
+                            fig_s = mini_chart(
+                                {"融券餘額（億）": (short_series, "#f97316")},
+                                height=120,
+                            )
+                            st.plotly_chart(fig_s, use_container_width=True)
+                    else:
+                        st.info("融券餘額資料暫無法取得")
                 else:
                     st.info("融資餘額歷史資料暫無法取得")
 
-        # ── 市場廣度：TAIEX vs OTC ──
+        # ── 市場廣度：TAIEX vs OTC vs 台積電 ──
         with tc3:
             _t, _i = st.columns([10, 2], vertical_alignment="center")
             _t.subheader("📐 市場廣度", anchor=False)
@@ -942,11 +1447,17 @@ def main():
 
 | 指標 | 說明 |
 |------|------|
-| **加權指數 ^TWII** | 市值加權，台積電影響力極大 |
-| **櫃買指數 ^TWOII** | 中小型股為主，反映市場廣度 |
+| **加權指數 ^TWII** | 市值加權，台積電佔約 30% |
+| **櫃買指數 ^TWOII** | 中小型股為主，反映整體廣度 |
+| **台積電 2330.TW** | 最大權值股，領漲/落後是方向確認指標 |
 
-- OTC 跑贏 TAIEX > 1% → 廣度健康，中小型股活躍
-- OTC 落後 TAIEX > 1.5% → **拉積盤**警訊，大盤虛弱
+**OTC vs 加權：**
+- OTC 跑贏 > 1% → 廣度健康，中小型股活躍
+- OTC 落後 > 1.5% → 拉積盤，大盤虛弱
+
+**台積電相對強弱：**
+- 台積電近5日跑贏大盤 > 2% → +1（半導體訊號確認）
+- 台積電近5日落後大盤 > 2% → -1（最大權值股轉弱）
 """)
             if tw_breadth:
                 mc1, mc2 = st.columns(2)
@@ -967,11 +1478,32 @@ def main():
                 else:
                     st.info(f"廣度中性：OTC vs 加權 近5日差距 {rvs:+.2f}%")
 
+                # 台積電相對強弱
+                tsmc_rvs = tw_breadth.get("tsmc_vs_taiex_5d")
+                if tsmc_rvs is not None and tw_breadth.get("tsmc_cur") is not None:
+                    tsmc_color = "#22c55e" if tsmc_rvs >= 0 else "#ef4444"
+                    st.metric("台積電 (2330.TW)",
+                              f"{tw_breadth['tsmc_cur']:,.0f}",
+                              f"{tw_breadth['tsmc_chg_pct']:+.2f}%")
+                    if tsmc_rvs > 2:
+                        st.success(f"台積電領漲：近5日跑贏大盤 {tsmc_rvs:+.2f}%（+1）")
+                    elif tsmc_rvs < -2:
+                        st.warning(f"台積電落後：近5日落後大盤 {tsmc_rvs:.2f}%（-1）")
+                    else:
+                        st.markdown(
+                            f"<span style='color:{tsmc_color}; font-size:0.9rem'>"
+                            f"台積電 vs 大盤 近5日：{tsmc_rvs:+.2f}%</span>",
+                            unsafe_allow_html=True,
+                        )
+
                 norm = tw_breadth["normalized"]
-                fig = mini_chart({
+                chart_series = {
                     "加權 (TAIEX)": (norm["^TWII"],  "#3b82f6"),
                     "櫃買 (OTC)":   (norm["^TWOII"], "#22c55e"),
-                })
+                }
+                if tw_breadth.get("tsmc_normalized") is not None:
+                    chart_series["台積電 (2330)"] = (tw_breadth["tsmc_normalized"], "#a78bfa")
+                fig = mini_chart(chart_series)
                 st.plotly_chart(fig, use_container_width=True)
             else:
                 st.error("市場廣度資料載入失敗")
@@ -1107,21 +1639,7 @@ def main():
             unsafe_allow_html=True,
         )
 
-        tw_rec_label, tw_rec_color, tw_rec_desc = calc_tw_recommendation(
-            hv20              = tw_vix["hv20"]          if tw_vix    else None,
-            hv20_falling      = tw_vix["falling"]        if tw_vix    else False,
-            foreign_net_oi    = tw_chips.get("foreign_net_oi")    if tw_chips  else None,
-            foreign_3d_change = tw_chips.get("foreign_3d_change") if tw_chips  else None,
-            margin_chg_pct    = tw_margin["chg_pct"] if tw_margin else None,
-            otc_vs_taiex_5d   = tw_breadth["otc_vs_taiex_5d"]     if tw_breadth else None,
-            twd_5d            = tw_credit["twd_5d"]      if tw_credit else None,
-            twd_3d            = tw_credit["twd_3d"]      if tw_credit else None,
-            sox_below_ma60    = tw_cross["sox_below_ma60"] if tw_cross else False,
-            dxy_5d            = tw_cross["dxy_5d"]        if tw_cross else None,
-            taiex_3d          = tw_breadth["taiex_3d"]    if tw_breadth else None,
-            foreign_cash_3d   = tw_inst_cash.get("foreign_net_3d") if tw_inst_cash else None,
-            sitc_3d           = tw_inst_cash.get("sitc_net_3d")    if tw_inst_cash else None,
-        )
+        # tw_rec_label / tw_rec_color / tw_rec_desc 已在 spinner 後提前計算
 
         TW_STAGES = [
             ("🚨 系統性危機警告", "#dc2626"),
@@ -1179,6 +1697,7 @@ def main():
 | | < 12% | -3 |
 | **融資金額（代理）** | 單日減少 > 0.5% | +1 |
 | | 單日增加 > 0.5% | -1 |
+| **融券餘額（逆向）** | 近5日增加 > 3% | +1 |
 | **外資期貨** | 淨空單 > 30,000 口 | -2 |
 | | 近3日累計回補 > 10,000 口 | +1 |
 | **外資現股** | 近3日累計買超 > 100億 | +1 |
@@ -1187,6 +1706,8 @@ def main():
 | **投信現股** | 近3日累計買超 > 30億 | +1 |
 | **市場廣度** | OTC 近5日跑贏加權 > 1% | +1 |
 | | OTC 近5日落後加權 > 1.5% | -1 |
+| **台積電相對強弱** | 近5日跑贏大盤 > 2% | +1 |
+| | 近5日落後大盤 > 2% | -1 |
 | **台幣匯率** | 近5日升值 > 0.5% | +1 |
 | | 近5日急貶 > 1% | -2 |
 | **跨資產** | SOX 跌破季線 + DXY 近5日漲 > 1.5% | -1 |
