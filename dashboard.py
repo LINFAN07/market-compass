@@ -14,10 +14,14 @@ import os
 import re
 import json
 import pytz
-from dotenv import load_dotenv
 from streamlit_autorefresh import st_autorefresh
 
-load_dotenv(dotenv_path=r"c:\agent\market-compass\.env")
+# 本機用 .env 讀設定；Streamlit Cloud 無 dotenv 套件/檔案，靜默略過改用 st.secrets
+try:
+    from dotenv import load_dotenv
+    load_dotenv(dotenv_path=r"c:\agent\market-compass\.env")
+except Exception:
+    pass
 
 # ── 頁面設定 ────────────────────────────────────────────────
 st.set_page_config(
@@ -27,7 +31,13 @@ st.set_page_config(
 )
 
 TW_TZ    = pytz.timezone("Asia/Taipei")
+# GIST_ID：本機從 .env，雲端從 Streamlit secrets
 GIST_ID  = os.getenv("GIST_ID", "")
+if not GIST_ID:
+    try:
+        GIST_ID = st.secrets.get("GIST_ID", "")
+    except Exception:
+        GIST_ID = ""
 
 # 每 8 小時自動刷新
 st_autorefresh(interval=28_800_000, key="autorefresh")
