@@ -10,9 +10,14 @@ import pandas as pd
 import plotly.graph_objects as go
 from bs4 import BeautifulSoup
 from datetime import datetime, timedelta
+import os
 import re
+import json
 import pytz
+from dotenv import load_dotenv
 from streamlit_autorefresh import st_autorefresh
+
+load_dotenv(dotenv_path=r"c:\agent\market-compass\.env")
 
 # ── 頁面設定 ────────────────────────────────────────────────
 st.set_page_config(
@@ -21,7 +26,8 @@ st.set_page_config(
     layout="wide",
 )
 
-TW_TZ = pytz.timezone("Asia/Taipei")
+TW_TZ    = pytz.timezone("Asia/Taipei")
+GIST_ID  = os.getenv("GIST_ID", "")
 
 # 每 8 小時自動刷新
 st_autorefresh(interval=28_800_000, key="autorefresh")
@@ -65,6 +71,7 @@ def get_vix():
             "current": round(cur, 2),
             "change": round(cur - prev, 2),
             "change_pct": round((cur - prev) / prev * 100, 2),
+            "max_5d": round(float(hist.tail(5).max()), 2),  # 近5日高點，判斷恐慌是否回落
             "history": hist.tail(22),
         }
     except Exception:
@@ -222,6 +229,25 @@ def get_cross_assets():
             for s in sym_names
         }
         return {"normalized": norm.tail(60), "latest": latest}
+    except Exception:
+        return None
+
+
+@st.cache_data(ttl=28800, show_spinner=False)
+def get_spx_trend():
+    """S&P 500 趨勢過濾：200日均線（多空總開關）＋ 20日動能"""
+    try:
+        h = yf.Ticker("^GSPC").history(period="1y")["Close"].dropna()
+        if len(h) < 200:
+            return None
+        cur   = float(h.iloc[-1])
+        ma200 = float(h.tail(200).mean())
+        return {
+            "current":     round(cur, 2),
+            "ma200":       round(ma200, 2),
+            "above_ma200": cur > ma200,
+            "ret_20d":     round((cur / float(h.iloc[-21]) - 1) * 100, 2),
+        }
     except Exception:
         return None
 
@@ -691,6 +717,26 @@ def get_tw_export_orders():
         return None
 
 
+# ── 每日建議歷史（從 GitHub Gist 讀取）─────────────────────
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def load_rec_history():
+    """從 GitHub Gist 讀取每日建議歷史（TTL=1小時，公開 Gist 無需 token）"""
+    gist_id = GIST_ID
+    if not gist_id:
+        return []
+    try:
+        r = requests.get(
+            f"https://api.github.com/gists/{gist_id}",
+            timeout=10,
+        )
+        r.raise_for_status()
+        content = r.json()["files"]["rec_history.json"]["content"]
+        return json.loads(content)
+    except Exception:
+        return []
+
+
 # ── 訊號判讀邏輯 ────────────────────────────────────────────
 
 def vix_zone(v):
@@ -717,15 +763,19 @@ def fg_label(s):
     return "極度貪婪", "#ef4444"
 
 
-def calc_recommendation(vix_cur, fg_score, rsp_vs_spy, hyg_5d, spread, tnx_chg=None, gld_chg=None, uup_chg=None):
+def calc_recommendation(vix_cur, fg_score, rsp_vs_spy, hyg_5d, spread,
+                        tnx_chg=None, gld_chg=None, uup_chg=None,
+                        vix_5d_max=None, spx_above_ma200=None, spx_20d_ret=None):
     """綜合評分 → 加倉/觀望/減倉建議"""
     score = 0
     crisis = False
 
     if vix_cur is not None:
-        if vix_cur > 40:       score += 3   # 極度恐慌，補最後子彈
-        elif vix_cur > 30:     score += 2   # 恐慌，第二批加倉
-        elif vix_cur > 25:     score += 1   # 情緒緊張，試水第一批
+        # 逆向加倉分須「VIX 高且已從近期高點回落」才算恐慌見頂；仍在飆升只給半分
+        rolling_over = vix_5d_max is not None and vix_cur < vix_5d_max * 0.9
+        if vix_cur > 40:       score += 3 if rolling_over else 1   # 極度恐慌
+        elif vix_cur > 30:     score += 2 if rolling_over else 1   # 恐慌
+        elif vix_cur > 25:     score += 1 if rolling_over else 0   # 情緒緊張
         elif vix_cur < 12:     score -= 3
         elif vix_cur < 15:     score -= 2
 
@@ -754,6 +804,16 @@ def calc_recommendation(vix_cur, fg_score, rsp_vs_spy, hyg_5d, spread, tnx_chg=N
 
     if uup_chg is not None and uup_chg > 1:
         score -= 1   # 美元暴漲 = 全球資金避險，非美資產承壓
+
+    # 動能確認：20日仍明顯下跌代表趨勢未止穩，壓抑樂觀
+    if spx_20d_ret is not None and spx_20d_ret < -6:
+        score -= 1
+
+    # 200日均線總開關：價在均線下＝結構性空頭，逆向加倉分打折並加警示
+    if spx_above_ma200 is False:
+        if score > 0:
+            score //= 2          # 把「買恐慌」的樂觀分數砍半
+        score -= 2               # 空頭趨勢警示
 
     if crisis:
         return ("🚨 危機警告", "#dc2626",
@@ -914,6 +974,126 @@ def mini_chart(series_dict: dict, height=140, h_lines=None):
     return fig
 
 
+@st.cache_data(ttl=3600, show_spinner=False)
+def load_index_price(market):
+    """抓指數股價歷史作為背景走勢線（tw=^TWII 加權, us=^GSPC S&P500）"""
+    ticker = "^TWII" if market == "tw" else "^GSPC"
+    try:
+        h = yf.Ticker(ticker).history(period="3mo")["Close"].dropna()
+        return ([d.strftime("%Y-%m-%d") for d in h.index],
+                [round(float(v), 2) for v in h.values])
+    except Exception:
+        return [], []
+
+
+def _render_history_section(history, market):
+    """指數股價走勢線 + 建議標記 + 緊湊表格（market='tw' 或 'us'）"""
+    label_key  = "tw_label"  if market == "tw" else "us_label"
+    color_key  = "tw_color"  if market == "tw" else "us_color"
+    index_key  = "tw_index"  if market == "tw" else "us_index"
+    index_name = "加權指數 (TAIEX)" if market == "tw" else "S&P 500"
+
+    valid = [e for e in history if e.get(index_key) is not None]
+
+    st.markdown(
+        "<div style='font-size:1.1rem;font-weight:700;margin:8px 0 10px'>📅 歷史建議紀錄</div>",
+        unsafe_allow_html=True,
+    )
+
+    if not valid:
+        st.info("尚無歷史紀錄，alert_worker 執行後將自動累積")
+        return
+
+    dates  = [e["date"] for e in valid]
+    labels = [e.get(label_key, "—") for e in valid]
+    colors = [e.get(color_key, "#888") for e in valid]
+
+    fig = go.Figure()
+
+    # 指數真實股價走勢（背景連續線）
+    px_dates, px_vals = load_index_price(market)
+    if px_dates:
+        fig.add_trace(go.Scatter(
+            x=px_dates, y=px_vals, mode="lines",
+            line=dict(color="#3b82f6", width=1.6),
+            name=index_name, showlegend=False,
+            hovertemplate=f"%{{x}}<br>{index_name} %{{y:,.0f}}<extra></extra>",
+        ))
+
+    # 建議標記疊在股價線上：對齊到當天真實收盤價
+    px_map = dict(zip(px_dates, px_vals))
+    grouped = {}
+    for d, lbl, clr in zip(dates, labels, colors):
+        y = px_map.get(d)              # 優先用真實收盤，讓點落在線上
+        if y is None:                  # 該日尚無股價（如假日）→ 用紀錄的指數值
+            y = next((e[index_key] for e in valid if e["date"] == d), None)
+        if y is None:
+            continue
+        grouped.setdefault(lbl, {"x": [], "y": [], "color": clr})
+        grouped[lbl]["x"].append(d)
+        grouped[lbl]["y"].append(y)
+
+    for lbl, data in grouped.items():
+        # 圖例名稱去掉開頭 emoji（如 🟠），避免和 Plotly 圓點重複成雙圓
+        legend_name = lbl.split(" ", 1)[-1] if " " in lbl else lbl
+        fig.add_trace(go.Scatter(
+            x=data["x"], y=data["y"],
+            mode="markers", name=legend_name,
+            marker=dict(
+                color=data["color"], size=13, symbol="circle",
+                line=dict(color="white", width=1.5),  # 白框讓點在線上更醒目
+            ),
+            hovertemplate=(
+                f"<b>%{{x}}</b><br>{index_name}: %{{y:,.0f}}<br>"
+                f"<b>{lbl}</b><extra></extra>"
+            ),
+        ))
+
+    fig.update_layout(
+        height=300,
+        margin=dict(l=4, r=4, t=6, b=4),
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        legend=dict(
+            orientation="h", y=-0.22, font=dict(size=11),
+            bgcolor="rgba(0,0,0,0)", itemsizing="constant",
+        ),
+        xaxis=dict(gridcolor="rgba(128,128,128,0.15)",
+                   tickformat="%m/%d", tickfont=dict(size=10)),
+        yaxis=dict(gridcolor="rgba(128,128,128,0.15)", tickformat=",.0f"),
+        hovermode="closest",
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+    # 緊湊表格（最新在上）
+    ix_col  = "加權指數" if market == "tw" else "S&P 500"
+    rows_html = ""
+    for e in reversed(valid):
+        c   = e.get(color_key, "#888")
+        lbl = e.get(label_key, "—")
+        ix  = e.get(index_key)
+        ix_str = f"{ix:,.0f}" if ix is not None else "—"
+        rows_html += (
+            f"<tr style='border-bottom:1px solid rgba(255,255,255,0.06)'>"
+            f"<td style='padding:6px 12px;font-size:0.82rem;opacity:0.55;white-space:nowrap'>{e['date']}</td>"
+            f"<td style='padding:6px 12px'>"
+            f"<span style='background:{c}22;color:{c};border:1px solid {c}55;"
+            f"border-radius:8px;padding:3px 10px;font-size:0.80rem;font-weight:600;"
+            f"white-space:nowrap'>{lbl}</span></td>"
+            f"<td style='padding:6px 12px;font-size:0.82rem;opacity:0.65;white-space:nowrap'>{ix_str}</td>"
+            f"</tr>"
+        )
+    st.markdown(
+        f"<table style='width:100%;border-collapse:collapse'>"
+        f"<thead><tr style='border-bottom:2px solid rgba(255,255,255,0.12)'>"
+        f"<th style='padding:6px 12px;text-align:left;font-size:0.75rem;opacity:0.4;font-weight:600'>日期</th>"
+        f"<th style='padding:6px 12px;text-align:left;font-size:0.75rem;opacity:0.4;font-weight:600'>建議</th>"
+        f"<th style='padding:6px 12px;text-align:left;font-size:0.75rem;opacity:0.4;font-weight:600'>{ix_col}</th>"
+        f"</tr></thead><tbody>{rows_html}</tbody></table>",
+        unsafe_allow_html=True,
+    )
+
+
 # ── 主程式 ──────────────────────────────────────────────────
 
 def main():
@@ -932,6 +1112,7 @@ def main():
             st.rerun()
 
     tab_tw, tab_us = st.tabs(["📊 台股", "🇺🇸 美股"])
+    rec_history = load_rec_history()
 
     # ════════════════════════════════════════════════════════
     # 台股 Tab
@@ -1145,7 +1326,9 @@ def main():
                     f"目前 {_short_txt}，不落入特定象限</div>"
                 )
             st.markdown(
-                "<div style='margin:16px 0 4px;font-weight:bold;font-size:0.9rem'>宏觀與短線背離解讀</div>",
+                "<div style='margin:16px 0 4px;font-weight:bold;font-size:0.9rem'>宏觀與短線背離解讀"
+                "<span style='color:#94a3b8;font-size:0.78rem;font-weight:normal;margin-left:6px'>"
+                "（僅供參考，非投資建議）</span></div>",
                 unsafe_allow_html=True,
             )
             st.markdown(_banner_html, unsafe_allow_html=True)
@@ -1634,7 +1817,7 @@ def main():
         st.markdown(
             "<div style='display:flex; align-items:baseline; gap:8px; margin-bottom:8px;'>"
             "<span style='font-size:1.5rem; font-weight:700; color:#1e293b;'>🎯 台股綜合建議</span>"
-            "<span style='color:#94a3b8; font-size:0.8rem;'>（僅供參考，非投資建議。）</span>"
+            "<span style='color:#94a3b8; font-size:0.8rem;'>（僅供參考，非投資建議）</span>"
             "</div>",
             unsafe_allow_html=True,
         )
@@ -1776,16 +1959,20 @@ def main():
 > **黃金加倉組合**：HV20 > 28% 且回落 + 外資期貨回補 > 10,000 口 + 外資現股近3日買超
 """)
 
+        st.divider()
+        _render_history_section(rec_history, market="tw")
+
     # ════════════════════════════════════════════════════════
     # 美股 Tab
     # ════════════════════════════════════════════════════════
     with tab_us:
         with st.spinner("載入美股資料…"):
-            vix      = get_vix()
-            fg       = get_fear_greed()
-            breadth  = get_market_breadth()
-            credit   = get_credit()
-            cross    = get_cross_assets()
+            vix       = get_vix()
+            fg        = get_fear_greed()
+            breadth   = get_market_breadth()
+            credit    = get_credit()
+            cross     = get_cross_assets()
+            spx_trend = get_spx_trend()
 
         # ────────────────────────────────────────────────────
         # 第一行：VIX ／ 恐懼貪婪 ／ 市場廣度
@@ -2084,7 +2271,7 @@ def main():
         st.markdown(
             "<div style='display:flex; align-items:baseline; gap:8px; margin-bottom:8px;'>"
             "<span style='font-size:1.5rem; font-weight:700; color:#1e293b;'>🎯 綜合建議</span>"
-            "<span style='color:#94a3b8; font-size:0.8rem;'>（僅供參考，非投資建議。）</span>"
+            "<span style='color:#94a3b8; font-size:0.8rem;'>（僅供參考，非投資建議）</span>"
             "</div>",
             unsafe_allow_html=True,
         )
@@ -2098,6 +2285,9 @@ def main():
             cross["latest"]["^TNX"]["chg_pct"] if cross   else None,
             cross["latest"]["GLD"]["chg_pct"]  if cross   else None,
             cross["latest"]["UUP"]["chg_pct"]  if cross   else None,
+            vix["max_5d"]            if vix       else None,
+            spx_trend["above_ma200"] if spx_trend else None,
+            spx_trend["ret_20d"]     if spx_trend else None,
         )
 
         # 六階段進度條：當前階段高亮，其餘淡化
@@ -2247,6 +2437,9 @@ def main():
 
     > **高收益利差 > 6%**（600 bps）= 歷史危機水位，如 2008 GFC、2020 COVID
                 """)
+
+        st.divider()
+        _render_history_section(rec_history, market="us")
 
 
 if __name__ == "__main__":
