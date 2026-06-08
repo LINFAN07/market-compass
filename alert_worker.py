@@ -834,13 +834,19 @@ def run():
             crypto_label = _calc_crypto_recommendation(crypto)
             crypto_index = crypto.get("btc_price")
 
-            if us_label is None:
-                print(f"[{now_str}] 美股指標資料不完整，跳過本次")
-            else:
-                # 寫入 Gist 歷史（含加密；寄信仍只看美股等級）
+            # 台股、美股分開寫入（獨立判斷）
+            if tw_label is not None:
                 _update_daily_history(us_label, tw_label, tw_index, us_index,
                                       crypto_label, crypto_index)
-                print(f"[{now_str}] Gist 已更新：美股={us_label}，台股={tw_label}，加密={crypto_label}")
+                print(f"[{now_str}] Gist 已更新：台股={tw_label}，指數={tw_index}")
+            else:
+                print(f"[{now_str}] 台股指標資料不完整，跳過台股寫入")
+
+            if us_label is not None:
+                # 美股資料完整才寫入 & 檢查等級變化
+                _update_daily_history(us_label, tw_label, tw_index, us_index,
+                                      crypto_label, crypto_index)
+                print(f"[{now_str}] Gist 已更新：美股={us_label}，加密={crypto_label}")
 
                 # 等級變化 → 寄信
                 last = get_last_label()
@@ -858,6 +864,8 @@ def run():
                     set_last_label(us_label)
                 else:
                     print(f"[{now_str}] 等級未變，不寄信")
+            else:
+                print(f"[{now_str}] 美股指標資料不完整，跳過美股寫入")
 
         except Exception as e:
             print(f"[{now_str}] 發生錯誤：{e}")
