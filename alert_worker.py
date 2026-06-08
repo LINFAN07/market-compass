@@ -29,15 +29,20 @@ CHECK_INTERVAL  = 3600  # 每小時（秒）
 
 # 建議等級 → 顏色對照（與 dashboard.py 一致）
 _COLOR = {
+    # 美股
     "🚨 危機警告":       "#dc2626",
     "🔴 考慮減倉":       "#ef4444",
     "🟠 偏向謹慎":       "#f97316",
-    "⏸️ 觀望":          "#f59e0b",
+    "⏸️ 觀望":          "#94a3b8",
     "🟡 偏向加倉":       "#84cc16",
     "✅ 加倉機會":       "#22c55e",
     "🚨 系統性危機警告":  "#dc2626",
     "🔴 考慮減倉/避險":  "#ef4444",
     "✅ 強烈加倉機會":   "#22c55e",
+    # 加密（新版六段標籤）
+    "✅ 重倉加倉":       "#22c55e",
+    "🟢 階梯加倉":       "#84cc16",
+    "🟡 基礎定投":       "#eab308",
 }
 
 
@@ -133,6 +138,243 @@ def _get_cross_assets():
         }
     except Exception:
         return None
+
+
+def _get_coinmetrics_btc_local():
+    """CoinMetrics Community API — BTC 鏈上歷史（alert_worker 無 cache 版）"""
+    try:
+        r = requests.get(
+            "https://community-api.coinmetrics.io/v4/timeseries/asset-metrics",
+            params={
+                "assets": "btc",
+                # CapRealUSD 屬於 CoinMetrics 付費層，免費帳號 403
+                "metrics": "CapMVRVCur,CapMrktCurUSD,SplyCur,IssTotNtv,PriceUSD",
+                "start_time": "2023-01-01",
+                "frequency": "1d",
+                "page_size": 10000,
+            },
+            headers={"User-Agent": "Mozilla/5.0"},
+            timeout=30,
+        )
+        r.raise_for_status()
+        records = r.json().get("data", [])
+        if not records:
+            return None
+        df = pd.DataFrame(records)
+        df["time"] = pd.to_datetime(df["time"]).dt.tz_localize(None)
+        df = df.set_index("time").sort_index()
+        for col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+        return df
+    except Exception:
+        return None
+
+
+def _get_fred_m2_local():
+    """FRED M2SL — US M2 YoY（alert_worker 無 cache 版）"""
+    try:
+        r = requests.get(
+            "https://fred.stlouisfed.org/graph/fredgraph.csv?id=M2SL&cosd=2019-01-01",
+            headers={"User-Agent": "Mozilla/5.0"}, timeout=8)
+        df = pd.read_csv(StringIO(r.text))
+        df.columns = ["date", "m2"]
+        df = df[df["m2"] != "."].copy()
+        df["m2"] = pd.to_numeric(df["m2"])
+        if len(df) >= 13:
+            yoy = (float(df["m2"].iloc[-1]) / float(df["m2"].iloc[-13]) - 1) * 100
+            return {"m2_yoy": round(yoy, 2), "m2_expanding": yoy >= 0}
+    except Exception:
+        pass
+    return {"m2_yoy": None, "m2_expanding": None}
+
+
+def _get_crypto():
+    """加密四層決策指標（與 dashboard.py get_crypto 邏輯相同，alert_worker 無 cache 版）"""
+    import yfinance as yf
+    H = {"User-Agent": "Mozilla/5.0"}
+    res = dict(
+        m2_yoy=None, m2_expanding=None,
+        mvrv=None, mvrv_zscore=None, nupl_approx=None,
+        realized_price=None, realized_ratio=None, puell=None,
+        mayer=None, btc_price=None,
+        cfg=None, funding=None,
+        pi_111dma=None, pi_350x2=None, pi_cross=None, pi_warning=None,
+        ahr999_approx=None,
+    )
+
+    # FRED M2
+    try:
+        res.update(_get_fred_m2_local())
+    except Exception:
+        pass
+
+    # CoinMetrics 鏈上指標
+    try:
+        cm = _get_coinmetrics_btc_local()
+        if cm is not None and len(cm) >= 365:
+            if "CapMVRVCur" in cm.columns:
+                s = cm["CapMVRVCur"].dropna()
+                if len(s):
+                    v = float(s.iloc[-1])
+                    res["mvrv"] = round(v, 2)
+                    if v > 0:
+                        res["nupl_approx"] = round(1 - 1 / v, 3)
+            if "CapMrktCurUSD" in cm.columns and "CapRealUSD" in cm.columns:
+                mc = cm["CapMrktCurUSD"].dropna()
+                rc = cm["CapRealUSD"].reindex(mc.index).dropna()
+                common = mc.index.intersection(rc.index)
+                if len(common) >= 200:
+                    std = float(mc.loc[common].std())
+                    if std > 0:
+                        diff = float(mc.loc[common].iloc[-1]) - float(rc.loc[common].iloc[-1])
+                        res["mvrv_zscore"] = round(diff / std, 2)
+            if "CapRealUSD" in cm.columns and "SplyCur" in cm.columns:
+                rc = cm["CapRealUSD"].dropna()
+                sp = cm["SplyCur"].dropna()
+                common = rc.index.intersection(sp.index)
+                if len(common):
+                    res["realized_price"] = round(
+                        float(rc.loc[common].iloc[-1]) / float(sp.loc[common].iloc[-1]), 0)
+            if "IssTotNtv" in cm.columns and "PriceUSD" in cm.columns:
+                iss = cm["IssTotNtv"].dropna()
+                px  = cm["PriceUSD"].dropna()
+                common = iss.index.intersection(px.index)
+                if len(common) >= 365:
+                    rev = iss.loc[common] * px.loc[common]
+                    avg = float(rev.tail(365).mean())
+                    if avg > 0:
+                        res["puell"] = round(float(rev.iloc[-1]) / avg, 2)
+    except Exception:
+        pass
+
+    # 加密恐懼貪婪
+    try:
+        d = requests.get("https://api.alternative.me/fng/?limit=1",
+                         headers=H, timeout=10).json()["data"]
+        res["cfg"] = int(d[0]["value"])
+    except Exception:
+        pass
+
+    # 資金費率（CoinGecko derivatives，Binance BTC 永續，中位數備援；%/8h）
+    try:
+        dv = requests.get("https://api.coingecko.com/api/v3/derivatives",
+                          headers=H, timeout=12).json()
+        btc_perp = [x for x in dv
+                    if x.get("contract_type") == "perpetual"
+                    and str(x.get("symbol", "")).upper().startswith("BTC")
+                    and x.get("funding_rate") is not None]
+        bnb = next((x for x in btc_perp if "Binance" in str(x.get("market", ""))), None)
+        if bnb:
+            res["funding"] = round(float(bnb["funding_rate"]), 4)
+        elif btc_perp:
+            res["funding"] = round(float(np.median([float(x["funding_rate"]) for x in btc_perp])), 4)
+    except Exception:
+        pass
+
+    # yfinance：Mayer / Pi Cycle / AHR999 / BTC 現價
+    try:
+        h = yf.Ticker("BTC-USD").history(period="2y")["Close"].dropna()
+        if len(h) >= 200:
+            price = float(h.iloc[-1])
+            res["btc_price"] = round(price, 0)
+            res["mayer"]     = round(price / float(h.tail(200).mean()), 2)
+        if len(h) >= 350:
+            ma111   = float(h.tail(111).mean())
+            ma350x2 = float(h.tail(350).mean()) * 2
+            gap = (ma350x2 - ma111) / ma350x2
+            res.update(pi_111dma=round(ma111, 0), pi_350x2=round(ma350x2, 0),
+                       pi_cross=ma111 >= ma350x2, pi_warning=(0 <= gap < 0.05))
+        if len(h) >= 120 and res["realized_price"]:
+            ma120 = float(h.tail(120).mean())
+            res["ahr999_approx"] = round(
+                (float(h.iloc[-1]) / ma120) * (float(h.iloc[-1]) / res["realized_price"]), 3)
+    except Exception:
+        pass
+
+    # 派生：realized_ratio
+    if res["btc_price"] and res["realized_price"]:
+        res["realized_ratio"] = round(res["btc_price"] / res["realized_price"], 3)
+
+    return res
+
+
+def _calc_crypto_recommendation(c):
+    """加密四層評分 → 建議標籤字串（與 dashboard.py calc_crypto_recommendation 邏輯同步）
+
+    alert_worker 只需要標籤字串（用於歷史紀錄及等級變化偵測），不需要完整 5-tuple。
+    """
+    mvrv       = c.get("mvrv")
+    mvrv_z     = c.get("mvrv_zscore")
+    nupl       = c.get("nupl_approx")
+    rp_ratio   = c.get("realized_ratio")
+    puell      = c.get("puell")
+    mayer      = c.get("mayer")
+    cfg        = c.get("cfg")
+    ahr999     = c.get("ahr999_approx")
+    funding    = c.get("funding")
+    pi_cross   = c.get("pi_cross")
+    pi_warning = c.get("pi_warning")
+    m2_expand  = c.get("m2_expanding")
+
+    m2_mult = 0.5 if (m2_expand is not None and not m2_expand) else 1.0
+
+    # L1 加倉面
+    buy = 0.0
+    if mvrv is not None:
+        if mvrv <= 1.0:    buy += 2
+        elif mvrv <= 1.2:  buy += 1
+    if mvrv_z is not None:
+        if mvrv_z <= 0.1:   buy += 2
+        elif mvrv_z <= 0.5: buy += 1
+    if nupl is not None:
+        if nupl <= 0:       buy += 2
+        elif nupl <= 0.25:  buy += 1
+    if rp_ratio is not None:
+        if rp_ratio <= 1.0:    buy += 2
+        elif rp_ratio <= 1.08: buy += 1
+    if puell is not None:
+        if puell <= 0.5:   buy += 2
+        elif puell <= 0.8: buy += 1
+    if mayer is not None:
+        if mayer <= 0.8:   buy += 2
+        elif mayer <= 1.0: buy += 1
+    if cfg is not None:
+        if cfg < 15:   buy += 2
+        elif cfg < 25: buy += 1
+    if ahr999 is not None:
+        if ahr999 <= 0.45:  buy += 1
+        elif ahr999 <= 1.2: buy += 0.5
+
+    buy_adj = buy * m2_mult
+
+    # L1/L2 減倉面
+    sell = 0
+    if mvrv_z is not None:
+        if mvrv_z >= 6.0:   sell += 2
+        elif mvrv_z >= 4.0: sell += 1
+    if nupl is not None:
+        if nupl >= 0.75:   sell += 2
+        elif nupl >= 0.5:  sell += 1
+    if pi_cross:           sell += 2
+    elif pi_warning:       sell += 1
+    if cfg is not None:
+        if cfg >= 85:   sell += 2
+        elif cfg >= 80: sell += 1
+    fr_ann = (funding * 3 * 365 * 100) if funding is not None else None
+    if fr_ann is not None:
+        if fr_ann >= 50:   sell += 2
+        elif fr_ann >= 30: sell += 1
+
+    # 決策（減倉優先）
+    if sell >= 8:  return "🔴 考慮減倉"
+    if sell >= 5:  return "🟠 偏向謹慎"
+    if sell >= 3:  return "⏸️ 觀望"
+    if buy_adj >= 9:
+        gate = fr_ann is None or fr_ann < 30
+        return "✅ 重倉加倉" if gate else "🟢 階梯加倉"
+    if buy_adj >= 6:  return "🟢 階梯加倉"
+    if buy_adj >= 3:  return "🟡 基礎定投"
+    return "⏸️ 觀望"
 
 
 # ── 台股資料抓取 ──────────────────────────────────────────────
@@ -503,8 +745,9 @@ def _save_gist_history(history):
     )
 
 
-def _update_daily_history(us_label, tw_label, tw_index=None, us_index=None):
-    """將今日台股 + 美股建議與指數收盤寫入 Gist（同日覆蓋最新值）"""
+def _update_daily_history(us_label, tw_label, tw_index=None, us_index=None,
+                          crypto_label=None, crypto_index=None):
+    """將今日台股 + 美股 + 加密建議與指數收盤寫入 Gist（同日覆蓋最新值）"""
     today   = datetime.now(TW_TZ).strftime("%Y-%m-%d")
     history = _load_gist_history()
     entry   = {
@@ -513,6 +756,8 @@ def _update_daily_history(us_label, tw_label, tw_index=None, us_index=None):
         "tw_index": tw_index,
         "us_label": us_label, "us_color": _COLOR.get(us_label, "#888"),
         "us_index": us_index,
+        "crypto_label": crypto_label, "crypto_color": _COLOR.get(crypto_label, "#888"),
+        "crypto_index": crypto_index,
     }
     for i, rec in enumerate(history):
         if rec["date"] == today:
@@ -585,13 +830,17 @@ def run():
             tw_label   = _calc_tw_recommendation(tw_signals)
             tw_index   = tw_signals.get("twii_cur")
             us_index   = _get_spx()
+            crypto       = _get_crypto()
+            crypto_label = _calc_crypto_recommendation(crypto)
+            crypto_index = crypto.get("btc_price")
 
             if us_label is None:
                 print(f"[{now_str}] 美股指標資料不完整，跳過本次")
             else:
-                # 寫入 Gist 歷史
-                _update_daily_history(us_label, tw_label, tw_index, us_index)
-                print(f"[{now_str}] Gist 已更新：美股={us_label}，台股={tw_label}")
+                # 寫入 Gist 歷史（含加密；寄信仍只看美股等級）
+                _update_daily_history(us_label, tw_label, tw_index, us_index,
+                                      crypto_label, crypto_index)
+                print(f"[{now_str}] Gist 已更新：美股={us_label}，台股={tw_label}，加密={crypto_label}")
 
                 # 等級變化 → 寄信
                 last = get_last_label()

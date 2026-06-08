@@ -191,7 +191,7 @@ def get_credit():
             fred_r = requests.get(
                 "https://fred.stlouisfed.org/graph/fredgraph.csv?id=BAMLH0A0HYM2",
                 headers={"User-Agent": "Mozilla/5.0"},
-                timeout=8,
+                timeout=5,   # FRED 在部分地區會逾時，快速失敗走 fallback
             )
             from io import StringIO
             sdf = pd.read_csv(StringIO(fred_r.text))
@@ -260,6 +260,242 @@ def get_spx_trend():
         }
     except Exception:
         return None
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def _get_coinmetrics_btc():
+    """CoinMetrics Community API — BTC 鏈上歷史（每日快取）
+
+    免費層指標：CapMVRVCur / CapMrktCurUSD / CapRealUSD / SplyCur / IssTotNtv / PriceUSD
+    拉取 2012-01-01 至今完整序列，供 MVRV Z-Score 的全歷史標準差計算。
+    """
+    try:
+        r = requests.get(
+            "https://community-api.coinmetrics.io/v4/timeseries/asset-metrics",
+            params={
+                "assets": "btc",
+                # CapRealUSD 屬於 CoinMetrics 付費層（免費帳號 403），故移除
+                # Z-Score / Realized Price / Realized Ratio 無法計算，顯示「—」
+                "metrics": "CapMVRVCur,CapMrktCurUSD,SplyCur,IssTotNtv,PriceUSD",
+                "start_time": "2023-01-01",   # Puell 需要 365 日滾動，取近 2 年即可
+                "frequency": "1d",
+                "page_size": 10000,
+            },
+            headers={"User-Agent": "Mozilla/5.0"},
+            timeout=30,
+        )
+        r.raise_for_status()
+        records = r.json().get("data", [])
+        if not records:
+            return None
+        df = pd.DataFrame(records)
+        df["time"] = pd.to_datetime(df["time"]).dt.tz_localize(None)
+        df = df.set_index("time").sort_index()
+        for col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+        return df
+    except Exception:
+        return None
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def _get_fred_macro():
+    """FRED — 美國 M2 年增率 + Fed 資產負債表 MA4W（每日快取）
+
+    M2SL：美國廣義貨幣供給量（月度），全球 M2 的免費代理，相關性 ~80%。
+    WALCL：Fed 總資產（週度，百萬美元）；取 MA4W 過濾 TGA 轉帳雜訊。
+    """
+    from io import StringIO
+    H = {"User-Agent": "Mozilla/5.0"}
+    out = dict(m2_yoy=None, m2_expanding=None, m2_history=None,
+               fed_bs=None, fed_bs_ma4w=None, fed_bs_expanding=None, fed_bs_history=None)
+    try:
+        r = requests.get(
+            "https://fred.stlouisfed.org/graph/fredgraph.csv?id=M2SL&cosd=2019-01-01",
+            headers=H, timeout=8)
+        df = pd.read_csv(StringIO(r.text))
+        df.columns = ["date", "m2"]
+        df = df[df["m2"] != "."].copy()
+        df["m2"]   = pd.to_numeric(df["m2"])
+        df["date"] = pd.to_datetime(df["date"])
+        df = df.set_index("date").sort_index()
+        if len(df) >= 13:
+            yoy = (float(df["m2"].iloc[-1]) / float(df["m2"].iloc[-13]) - 1) * 100
+            out["m2_yoy"]       = round(yoy, 2)
+            out["m2_expanding"] = yoy >= 0
+            out["m2_history"]   = df["m2"].tail(60)
+    except Exception:
+        pass
+    try:
+        r = requests.get(
+            "https://fred.stlouisfed.org/graph/fredgraph.csv?id=WALCL&cosd=2022-01-01",
+            headers=H, timeout=8)
+        df = pd.read_csv(StringIO(r.text))
+        df.columns = ["date", "bs"]
+        df = df[df["bs"] != "."].copy()
+        df["bs"]   = pd.to_numeric(df["bs"]) / 1e6   # 百萬 → 兆美元
+        df["date"] = pd.to_datetime(df["date"])
+        df = df.set_index("date").sort_index()
+        if len(df) >= 8:
+            ma4w_cur  = float(df["bs"].tail(4).mean())
+            ma4w_prev = float(df["bs"].tail(8).head(4).mean())
+            out["fed_bs"]           = round(float(df["bs"].iloc[-1]), 2)
+            out["fed_bs_ma4w"]      = round(ma4w_cur, 2)
+            out["fed_bs_expanding"] = ma4w_cur >= ma4w_prev
+            out["fed_bs_history"]   = df["bs"].tail(104)
+    except Exception:
+        pass
+    return out
+
+
+@st.cache_data(ttl=28800, show_spinner=False)
+def get_crypto():
+    """加密貨幣四層決策指標（免費版，8 小時快取）
+
+    L0 宏觀閘門  ：US M2 YoY（FRED M2SL）+ Fed 資產負債表 MA4W（WALCL）
+    L1 加倉面    ：MVRV / MVRV Z-Score / NUPL近似 / Realized Price /
+                   Puell Multiple / Mayer Multiple / 加密 F&G / AHR999近似
+    L1 減倉面    ：MVRV Z-Score / NUPL近似 / Pi Cycle Top（111DMA vs 350DMA×2）
+    L2 衍生品    ：資金費率（%/8h）+ 加密 F&G 高位
+
+    資料來源全數選用美國 IP 友善端點（Streamlit Cloud 部署於美國機房），
+    避開會封鎖美國 IP 的幣安/Bybit/OKX 現貨衍生品端點。
+    """
+    H = {"User-Agent": "Mozilla/5.0"}
+    res = dict(
+        # L0
+        m2_yoy=None, m2_expanding=None,
+        fed_bs=None, fed_bs_ma4w=None, fed_bs_expanding=None,
+        # L1 加倉面
+        mvrv=None, mvrv_zscore=None, nupl_approx=None,
+        realized_price=None, realized_ratio=None, puell=None,
+        mayer=None, btc_price=None,
+        cfg=None, cfg_label=None, cfg_hist=None,
+        ahr999_approx=None,
+        # L1 減倉面（Pi Cycle Top）
+        pi_111dma=None, pi_350x2=None, pi_cross=None, pi_warning=None,
+        # L2
+        funding=None,
+        # 展示輔助
+        btc_dom=None, stable_dom=None,
+    )
+
+    # FRED + CoinMetrics 使用各自的 86400s 快取；命中後不占本次請求時間
+    try:
+        fred = _get_fred_macro()
+        for k in ("m2_yoy", "m2_expanding", "fed_bs", "fed_bs_ma4w", "fed_bs_expanding"):
+            res[k] = fred.get(k)
+    except Exception:
+        pass
+
+    try:
+        cm = _get_coinmetrics_btc()
+        if cm is not None and len(cm) >= 365:
+            if "CapMVRVCur" in cm.columns:
+                s = cm["CapMVRVCur"].dropna()
+                if len(s):
+                    v = float(s.iloc[-1])
+                    res["mvrv"] = round(v, 2)
+                    if v > 0:
+                        res["nupl_approx"] = round(1 - 1 / v, 3)
+            # MVRV Z-Score：(市值 - 已實現市值) / std(歷史市值)
+            if "CapMrktCurUSD" in cm.columns and "CapRealUSD" in cm.columns:
+                mc = cm["CapMrktCurUSD"].dropna()
+                rc = cm["CapRealUSD"].reindex(mc.index).dropna()
+                common = mc.index.intersection(rc.index)
+                if len(common) >= 200:
+                    std = float(mc.loc[common].std())
+                    if std > 0:
+                        diff = float(mc.loc[common].iloc[-1]) - float(rc.loc[common].iloc[-1])
+                        res["mvrv_zscore"] = round(diff / std, 2)
+            # Realized Price = 已實現市值 / 流通供應量
+            if "CapRealUSD" in cm.columns and "SplyCur" in cm.columns:
+                rc = cm["CapRealUSD"].dropna()
+                sp = cm["SplyCur"].dropna()
+                common = rc.index.intersection(sp.index)
+                if len(common):
+                    res["realized_price"] = round(
+                        float(rc.loc[common].iloc[-1]) / float(sp.loc[common].iloc[-1]), 0)
+            # Puell Multiple = 今日礦工收入 / 365日均礦工收入
+            if "IssTotNtv" in cm.columns and "PriceUSD" in cm.columns:
+                iss = cm["IssTotNtv"].dropna()
+                px  = cm["PriceUSD"].dropna()
+                common = iss.index.intersection(px.index)
+                if len(common) >= 365:
+                    rev = iss.loc[common] * px.loc[common]
+                    avg = float(rev.tail(365).mean())
+                    if avg > 0:
+                        res["puell"] = round(float(rev.iloc[-1]) / avg, 2)
+    except Exception:
+        pass
+
+    # 4 個並行來源（F&G / 資金費率 / yfinance / CoinGecko 主導率）
+    def _fng():
+        d = requests.get("https://api.alternative.me/fng/?limit=30",
+                         headers=H, timeout=10).json()["data"]
+        vals = [int(x["value"]) for x in reversed(d)]
+        idx  = pd.to_datetime([int(x["timestamp"]) for x in reversed(d)], unit="s")
+        return {"cfg": int(d[0]["value"]),
+                "cfg_label": d[0].get("value_classification", ""),
+                "cfg_hist": pd.Series(vals, index=idx)}
+
+    def _funding():
+        # 資金費率（CoinGecko derivatives，Binance BTC 永續優先，中位數備援）
+        dv = requests.get("https://api.coingecko.com/api/v3/derivatives",
+                          headers=H, timeout=12).json()
+        btc_perp = [x for x in dv
+                    if x.get("contract_type") == "perpetual"
+                    and str(x.get("symbol", "")).upper().startswith("BTC")
+                    and x.get("funding_rate") is not None]
+        bnb = next((x for x in btc_perp if "Binance" in str(x.get("market", ""))), None)
+        if bnb:
+            return {"funding": round(float(bnb["funding_rate"]), 4)}
+        if btc_perp:
+            return {"funding": round(float(np.median([float(x["funding_rate"]) for x in btc_perp])), 4)}
+        return {}
+
+    def _yf_btc():
+        h = yf.Ticker("BTC-USD").history(period="2y")["Close"].dropna()
+        if len(h) < 200:
+            return {}
+        price = float(h.iloc[-1])
+        out = {"btc_price": round(price, 0),
+               "mayer":     round(price / float(h.tail(200).mean()), 2)}
+        # Pi Cycle Top：111DMA 穿越 350DMA×2 是歷史頂部訊號
+        if len(h) >= 350:
+            ma111   = float(h.tail(111).mean())
+            ma350x2 = float(h.tail(350).mean()) * 2
+            gap = (ma350x2 - ma111) / ma350x2
+            out.update(pi_111dma=round(ma111, 0), pi_350x2=round(ma350x2, 0),
+                       pi_cross=ma111 >= ma350x2, pi_warning=(0 <= gap < 0.05))
+        if len(h) >= 120:
+            out["_ma120"] = float(h.tail(120).mean())
+        return out
+
+    def _dominance():
+        mc = requests.get("https://api.coingecko.com/api/v3/global",
+                          headers=H, timeout=10).json()["data"]["market_cap_percentage"]
+        return {"btc_dom":    round(mc.get("btc", 0), 1),
+                "stable_dom": round(mc.get("usdt", 0) + mc.get("usdc", 0) + mc.get("dai", 0), 1)}
+
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=4) as ex:
+        futures = [ex.submit(fn) for fn in (_fng, _funding, _yf_btc, _dominance)]
+        for f in futures:
+            try:
+                res.update(f.result())
+            except Exception:
+                pass
+
+    # 派生指標（需要 btc_price + realized_price + _ma120）
+    ma120 = res.pop("_ma120", None)
+    if res["btc_price"] and res["realized_price"]:
+        res["realized_ratio"] = round(res["btc_price"] / res["realized_price"], 3)
+        if ma120:
+            res["ahr999_approx"] = round(
+                (res["btc_price"] / ma120) * (res["btc_price"] / res["realized_price"]), 3)
+
+    return res
 
 
 # ── 台股資料抓取 ─────────────────────────────────────────────
@@ -686,6 +922,149 @@ def get_tw_pmi():
         return None
 
 
+@st.cache_data(ttl=28800, show_spinner=False)
+def get_us_macro():
+    """美股宏觀背景（多指標綜合，不影響短線評分）
+
+    資料來源：
+      yfinance - 殖利率曲線（^TNX-^IRX, 10Y-3M 利差）、Fed 利率代理（^IRX）、WTI（CL=F）
+      BLS API  - 失業率（LNS14000000）、核心 CPI 指數（CUSR0000SA0L1E）
+      Sahm Rule 由 UNRATE 月度資料自算
+    """
+    import json as _json
+
+    def _pack(s, fmt_change=True):
+        """打包單一序列的現值、變化、歷史。"""
+        if s is None or len(s) < 1:
+            return None
+        cur  = float(s.iloc[-1])
+        prev = float(s.iloc[-2]) if len(s) >= 2 else None
+        chg  = round(cur - prev, 2) if (fmt_change and prev is not None) else None
+        return {"value": cur, "prev": prev, "change": chg,
+                "month": s.index[-1].strftime("%Y-%m-%d"), "history": s}
+
+    def _parse_bls(series_obj):
+        """BLS JSON series → 按月排序的 pd.Series（index=月初 Timestamp）"""
+        rows = []
+        for d in series_obj.get("data", []):
+            if not d["period"].startswith("M"):
+                continue
+            try:
+                val = float(d["value"])   # BLS 用 "-" 表示暫無資料，跳過
+            except (ValueError, TypeError):
+                continue
+            rows.append((pd.Timestamp(int(d["year"]), int(d["period"][1:]), 1), val))
+        rows.sort()
+        if not rows:
+            return None
+        dates, vals = zip(*rows)
+        return pd.Series(list(vals), index=list(dates))
+
+    try:
+        # ── 1. yfinance：一次批量下載殖利率 + 油價 ──
+        import yfinance as yf
+        yf_raw = yf.download(["^TNX", "^IRX", "CL=F"], period="2y",
+                              progress=False, auto_adjust=True)
+        yf_close = yf_raw["Close"] if "Close" in yf_raw.columns.get_level_values(0) else yf_raw
+        curve_s = ffr_s = wti_s = None
+        if "^TNX" in yf_close.columns and "^IRX" in yf_close.columns:
+            spread = (yf_close["^TNX"] - yf_close["^IRX"]).dropna()
+            curve_s = spread.tail(400) if not spread.empty else None
+        if "^IRX" in yf_close.columns:
+            ffr_raw = yf_close["^IRX"].dropna()
+            ffr_s = ffr_raw.tail(60) if not ffr_raw.empty else None
+        if "CL=F" in yf_close.columns:
+            wti_raw = yf_close["CL=F"].dropna()
+            wti_s = wti_raw.tail(400) if not wti_raw.empty else None
+
+        # ── 2. BLS：一次查詢拿失業率 + 核心 CPI ──
+        bls_resp = requests.post(
+            "https://api.bls.gov/publicAPI/v1/timeseries/data/",
+            data=_json.dumps({"seriesid": ["LNS14000000", "CUSR0000SA0L1E"], "lastn": 36}),
+            headers={"Content-type": "application/json"},
+            timeout=15,
+        )
+        unrate_raw = cpi_raw = None
+        for s in bls_resp.json().get("Results", {}).get("series", []):
+            parsed = _parse_bls(s)
+            if s["seriesID"] == "LNS14000000":
+                unrate_raw = parsed
+            elif s["seriesID"] == "CUSR0000SA0L1E":
+                cpi_raw = parsed
+
+        unrate_s = unrate_raw.tail(60) if unrate_raw is not None else None
+
+        # Sahm Rule 自算：3M移動均值 − 過去12個月內最低3M均值（≥0.5 = 衰退確認）
+        sahm_s = None
+        if unrate_raw is not None and len(unrate_raw) >= 15:
+            u3m = unrate_raw.rolling(3).mean()
+            sahm_calc = u3m - u3m.rolling(12).min()
+            sahm_s = sahm_calc.dropna().tail(60)
+
+        # 核心通膨 YoY（BLS 指數 → 年增率）
+        cpi_yoy = None
+        if cpi_raw is not None and len(cpi_raw) >= 13:
+            yoy = (cpi_raw.iloc[-1] / cpi_raw.iloc[-13] - 1) * 100
+            yoy_hist = (cpi_raw / cpi_raw.shift(12) - 1) * 100
+            cpi_yoy = {"value": round(float(yoy), 2),
+                       "month": cpi_raw.index[-1].strftime("%Y-%m"),
+                       "history": yoy_hist.dropna()}
+
+        ind = {
+            "curve":   _pack(curve_s),
+            "sahm":    _pack(sahm_s,  fmt_change=False),
+            "unrate":  _pack(unrate_s),
+            "cpi_yoy": cpi_yoy,
+            "ffr":     _pack(ffr_s),
+            "wti":     _pack(wti_s),
+        }
+
+        if all(v is None for v in ind.values()):
+            raise RuntimeError("宏觀指標全部取得失敗")
+
+        # ── 綜合「宏觀燈號」：分數越高＝對高估值股越不利（緊縮/風險）──
+        score, notes = 0, []
+        if cpi_yoy is not None:
+            v = cpi_yoy["value"]
+            if   v >= 4:   score += 2; notes.append(f"核心通膨 {v}%（高，Fed 難降息）")
+            elif v >= 3:   score += 1; notes.append(f"核心通膨 {v}%（偏高）")
+            elif v < 2.5:  score -= 1; notes.append(f"核心通膨 {v}%（溫和）")
+        if ind["curve"] is not None and ind["curve"]["value"] < 0:
+            score += 1; notes.append(f"殖利率曲線倒掛 {ind['curve']['value']:.2f}%（衰退預警）")
+        if ind["wti"] is not None and ind["wti"]["value"] >= 90:
+            score += 1; notes.append(f"油價 ${ind['wti']['value']:.0f}（供給通膨壓力）")
+
+        sahm_triggered = ind["sahm"] is not None and ind["sahm"]["value"] >= 0.5
+        if sahm_triggered:
+            light_name, light_desc, light_color = "衰退確認", "Sahm Rule 已觸發", "#dc2626"
+            macro_bullish = False
+        elif score >= 3:
+            light_name, light_desc, light_color = "明顯緊縮", "高估值股承壓", "#ef4444"
+            macro_bullish = False
+        elif score >= 1:
+            light_name, light_desc, light_color = "偏緊", "流動性偏向收緊", "#f97316"
+            macro_bullish = False
+        elif score <= -1:
+            light_name, light_desc, light_color = "偏寬鬆", "利於風險資產", "#22c55e"
+            macro_bullish = True
+        else:
+            light_name, light_desc, light_color = "中性", "無明顯方向", "#eab308"
+            macro_bullish = True
+
+        return {
+            "indicators": ind, "score": score,
+            "light_name": light_name, "light_desc": light_desc,
+            "light_color": light_color, "macro_bullish": macro_bullish,
+            "sahm_triggered": sahm_triggered, "notes": notes,
+        }
+    except RuntimeError:
+        raise          # 全失敗：往外傳，st.cache_data 不快取，下次重抓
+    except Exception as _e:
+        import traceback as _tb
+        print(f"[get_us_macro ERROR] {_e}\n{_tb.format_exc()}", flush=True)
+        return None    # 非預期錯誤：回 None，避免整頁壞掉
+
+
 @st.cache_data(ttl=86400, show_spinner=False)
 def get_tw_export_orders():
     """電子產品外銷訂單年增率（經濟部，月更）"""
@@ -844,6 +1223,117 @@ def calc_recommendation(vix_cur, fg_score, rsp_vs_spy, hyg_5d, spread,
             "訊號混合，等待更明確方向")
 
 
+def calc_crypto_recommendation(c):
+    """免費版四層加密評分 → 加倉/觀望/減倉建議（回傳 5-tuple）
+
+    回傳：(label, color, desc, buy_score_adj, sell_score)
+    減倉面優先：先計算 sell；若觸發減倉，加倉面直接暫停。
+    L0 US M2 YoY 收縮時，加倉有效分乘以 0.5。
+
+    六段標籤（由空到滿）：
+      ✅ 重倉加倉  →  🟢 階梯加倉  →  🟡 基礎定投
+      ⏸️ 觀望
+      🟠 偏向謹慎  →  🔴 考慮減倉
+    """
+    mvrv       = c.get("mvrv")
+    mvrv_z     = c.get("mvrv_zscore")
+    nupl       = c.get("nupl_approx")
+    rp_ratio   = c.get("realized_ratio")
+    puell      = c.get("puell")
+    mayer      = c.get("mayer")
+    cfg        = c.get("cfg")
+    ahr999     = c.get("ahr999_approx")
+    funding    = c.get("funding")
+    pi_cross   = c.get("pi_cross")
+    pi_warning = c.get("pi_warning")
+    m2_expand  = c.get("m2_expanding")
+
+    # L0：M2 收縮時加倉訊號打折（宏觀逆風）
+    m2_mult = 0.5 if (m2_expand is not None and not m2_expand) else 1.0
+
+    # === L1 加倉面（理論滿分 15 分）===
+    buy = 0.0
+    if mvrv is not None:
+        if mvrv <= 1.0:    buy += 2
+        elif mvrv <= 1.2:  buy += 1
+    if mvrv_z is not None:
+        if mvrv_z <= 0.1:   buy += 2
+        elif mvrv_z <= 0.5: buy += 1
+    if nupl is not None:
+        if nupl <= 0:       buy += 2
+        elif nupl <= 0.25:  buy += 1
+    if rp_ratio is not None:
+        if rp_ratio <= 1.0:    buy += 2
+        elif rp_ratio <= 1.08: buy += 1
+    if puell is not None:
+        if puell <= 0.5:   buy += 2
+        elif puell <= 0.8: buy += 1
+    if mayer is not None:
+        if mayer <= 0.8:   buy += 2
+        elif mayer <= 1.0: buy += 1
+    if cfg is not None:
+        if cfg < 15:   buy += 2
+        elif cfg < 25: buy += 1
+    if ahr999 is not None:
+        if ahr999 <= 0.45:  buy += 1
+        elif ahr999 <= 1.2: buy += 0.5
+
+    buy_adj = buy * m2_mult
+
+    # === L1/L2 減倉面（理論滿分 10 分）===
+    sell = 0
+    if mvrv_z is not None:
+        if mvrv_z >= 6.0:   sell += 2
+        elif mvrv_z >= 4.0: sell += 1
+    if nupl is not None:
+        if nupl >= 0.75:   sell += 2
+        elif nupl >= 0.5:  sell += 1
+    if pi_cross:           sell += 2
+    elif pi_warning:       sell += 1
+    if cfg is not None:
+        if cfg >= 85:   sell += 2
+        elif cfg >= 80: sell += 1
+    fr_ann = (funding * 3 * 365 * 100) if funding is not None else None
+    if fr_ann is not None:
+        if fr_ann >= 50:   sell += 2
+        elif fr_ann >= 30: sell += 1
+
+    # === 決策（減倉優先）===
+    m2_tag = f"（L0 ×{m2_mult}）" if m2_mult < 1.0 else ""
+    if sell >= 8:
+        return ("🔴 考慮減倉", "#ef4444",
+                "頂部共振警告（減倉≥8分），建議大幅減倉或清空槓桿，需動能確認後執行",
+                buy_adj, sell)
+    if sell >= 5:
+        return ("🟠 偏向謹慎", "#f97316",
+                "明顯過熱（減倉5-7分），停止加倉，分批減倉 1/3，需動能確認",
+                buy_adj, sell)
+    if sell >= 3:
+        return ("⏸️ 觀望", "#94a3b8",
+                "部分指標偏熱（減倉3-4分），暫停加倉，等待指標冷卻",
+                buy_adj, sell)
+    if buy_adj >= 9:
+        gate = fr_ann is None or fr_ann < 30
+        if gate:
+            return ("✅ 重倉加倉", "#22c55e",
+                    f"歷史級低估共振（加倉≥9分{m2_tag}），啟動備用抄底資金，需動能確認 + 費率年化<30%",
+                    buy_adj, sell)
+        return ("🟢 階梯加倉", "#84cc16",
+                f"低估但費率過熱（年化>{fr_ann:.0f}%），等待槓桿清洗後再重倉",
+                buy_adj, sell)
+    if buy_adj >= 6:
+        return ("🟢 階梯加倉", "#84cc16",
+                f"明顯低估（加倉6-8分{m2_tag}），在支撐位分批買入",
+                buy_adj, sell)
+    if buy_adj >= 3:
+        return ("🟡 基礎定投", "#eab308",
+                f"偏低估（加倉3-5分{m2_tag}），持續定投，不擇時",
+                buy_adj, sell)
+    return ("⏸️ 觀望", "#94a3b8",
+            f"訊號不足（加倉{buy_adj:.1f}分{m2_tag}），等待更多指標進入低估區間",
+            buy_adj, sell)
+
+
 # ── 台股訊號判讀 ─────────────────────────────────────────────
 
 def hv20_zone(v):
@@ -986,8 +1476,8 @@ def mini_chart(series_dict: dict, height=140, h_lines=None):
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def load_index_price(market):
-    """抓指數股價歷史作為背景走勢線（tw=^TWII 加權, us=^GSPC S&P500）"""
-    ticker = "^TWII" if market == "tw" else "^GSPC"
+    """抓指數股價歷史作為背景走勢線（tw=^TWII 加權, us=^GSPC S&P500, crypto=BTC-USD）"""
+    ticker = {"tw": "^TWII", "us": "^GSPC", "crypto": "BTC-USD"}.get(market, "^GSPC")
     try:
         h = yf.Ticker(ticker).history(period="3mo")["Close"].dropna()
         return ([d.strftime("%Y-%m-%d") for d in h.index],
@@ -997,11 +1487,11 @@ def load_index_price(market):
 
 
 def _render_history_section(history, market):
-    """指數股價走勢線 + 建議標記 + 緊湊表格（market='tw' 或 'us'）"""
-    label_key  = "tw_label"  if market == "tw" else "us_label"
-    color_key  = "tw_color"  if market == "tw" else "us_color"
-    index_key  = "tw_index"  if market == "tw" else "us_index"
-    index_name = "加權指數 (TAIEX)" if market == "tw" else "S&P 500"
+    """指數股價走勢線 + 建議標記 + 緊湊表格（market='tw' / 'us' / 'crypto'）"""
+    index_name = {"tw": "加權指數 (TAIEX)", "us": "S&P 500", "crypto": "比特幣 (BTC)"}[market]
+    label_key  = f"{market}_label"
+    color_key  = f"{market}_color"
+    index_key  = f"{market}_index"
 
     valid = [e for e in history if e.get(index_key) is not None]
 
@@ -1076,7 +1566,7 @@ def _render_history_section(history, market):
     st.plotly_chart(fig, use_container_width=True)
 
     # 緊湊表格（最新在上）
-    ix_col  = "加權指數" if market == "tw" else "S&P 500"
+    ix_col  = {"tw": "加權指數", "us": "S&P 500", "crypto": "比特幣"}[market]
     rows_html = ""
     for e in reversed(valid):
         c   = e.get(color_key, "#888")
@@ -1104,6 +1594,295 @@ def _render_history_section(history, market):
     )
 
 
+def _parallel_fetch(jobs):
+    """並行執行多個無參數抓取函式，回傳 {名稱: 結果}；個別失敗回 None。
+
+    各 get_*() 互相獨立，並行可把冷啟動從「全部相加」降到「最慢的那一個」。
+    會把當前 Streamlit 執行緒 context 傳給子執行緒，確保 @st.cache_data 正常運作。
+    """
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+    from streamlit.runtime.scriptrunner import add_script_run_ctx, get_script_run_ctx
+    ctx = get_script_run_ctx()
+
+    def _run(fn):
+        add_script_run_ctx(threading.current_thread(), ctx)
+        try:
+            return fn()
+        except Exception:
+            return None
+
+    with ThreadPoolExecutor(max_workers=max(1, len(jobs))) as ex:
+        futures = {k: ex.submit(_run, fn) for k, fn in jobs.items()}
+        return {k: f.result() for k, f in futures.items()}
+
+
+def _quad_card(is_active, bg_rgba_base, border_color_hex, label, title_color, title_text, body_text):
+    """背離 2×2 矩陣格子 HTML；active 格子加重顯示（台股與美股共用）"""
+    if is_active:
+        bg      = bg_rgba_base.replace("0.15", "0.30")
+        border  = f"2px solid {border_color_hex}"
+        badge   = (f"<span style='float:right;background:{border_color_hex};color:#fff;"
+                   f"font-size:0.62rem;padding:2px 7px;border-radius:10px;font-weight:bold;margin-top:1px'>"
+                   f"▶ 當前</span>")
+        dim     = ""
+    else:
+        bg      = bg_rgba_base
+        border  = f"1px solid {border_color_hex}66"
+        badge   = ""
+        dim     = "opacity:0.4;"
+    return (
+        f"<div style='{dim}background:{bg};border:{border};"
+        f"border-radius:8px;padding:12px'>"
+        f"<div style='font-size:0.72rem;opacity:0.55;margin-bottom:4px'>{label}{badge}</div>"
+        f"<div style='color:{title_color};font-weight:bold;font-size:0.9rem'>{title_text}</div>"
+        f"<div style='font-size:0.8rem;margin-top:5px'>{body_text}</div></div>"
+    )
+
+
+def _us_macro_mini_line(hist, color, hlines=None):
+    """美股宏觀指標的小型折線圖（緊湊版，無圖例）"""
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=hist.index, y=hist.values, mode="lines",
+        line=dict(color=color, width=2),
+    ))
+    for y_val, y_c, y_lbl in (hlines or []):
+        fig.add_hline(y=y_val, line_dash="dot", line_color=y_c,
+                      annotation_text=y_lbl, annotation_font_size=9)
+    fig.update_layout(
+        height=120, margin=dict(l=2, r=2, t=6, b=2),
+        paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+        showlegend=False,
+        xaxis=dict(gridcolor="rgba(128,128,128,0.2)", tickformat="%m/%y",
+                   tickfont=dict(size=9)),
+        yaxis=dict(gridcolor="rgba(128,128,128,0.2)", tickfont=dict(size=9)),
+    )
+    return fig
+
+
+def _us_macro_card(icon, title, value_str, status_txt, color, sub_txt):
+    """美股宏觀單一指標卡片 HTML"""
+    return (
+        f"<div style='background:var(--secondary-background-color);border-left:4px solid {color};"
+        f"border-radius:8px;padding:12px 16px'>"
+        f"<div style='color:{color};font-weight:bold;font-size:0.82rem;margin-bottom:6px'>{icon} {title}</div>"
+        f"<div style='font-size:1.9rem;font-weight:bold;line-height:1.1'>{value_str}</div>"
+        f"<div style='color:{color};font-size:0.88rem;font-weight:600;margin:4px 0'>{status_txt}</div>"
+        f"<div style='font-size:0.75rem;opacity:0.5'>{sub_txt}</div></div>"
+    )
+
+
+def _render_us_macro_section(us_macro, rec_label):
+    """美股宏觀背景 expander：綜合燈號 + 6 指標卡片 + 背離 2×2 矩陣"""
+    with st.expander("🌐 美股宏觀背景（利率/通膨/景氣循環，不影響短線評分）", expanded=False):
+        st.markdown(
+            "<div style='background:var(--secondary-background-color);border-left:3px solid #888;"
+            "border-radius:8px;padding:9px 16px;margin-bottom:14px;font-size:0.88rem'>"
+            "🕐 <b>宏觀指標看的是利率與通膨大環境</b>，市場通常領先景氣循環。"
+            "　宏觀不告訴你「什麼時候買」，而是告訴你「這次下跌可能有多深、需要多久復原」。</div>",
+            unsafe_allow_html=True,
+        )
+
+        if not us_macro:
+            st.markdown(
+                "<div style='background:var(--secondary-background-color);border-left:4px solid #888;"
+                "border-radius:8px;padding:12px 16px'>"
+                "<div style='font-weight:bold;font-size:0.82rem;margin-bottom:6px'>🌐 美股宏觀背景</div>"
+                "<div style='font-size:0.85rem;opacity:0.55'>宏觀資料取得失敗，請稍後重試</div></div>",
+                unsafe_allow_html=True,
+            )
+            st.link_button("前往 FRED 經濟數據", "https://fred.stlouisfed.org/")
+            return
+
+        ind = us_macro["indicators"]
+
+        # ── 綜合「宏觀燈號」橫幅（緊縮 ↔ 寬鬆）──
+        lc = us_macro["light_color"]
+        notes_txt = "　".join(us_macro["notes"]) if us_macro["notes"] else "目前無明顯緊縮/寬鬆訊號"
+        st.markdown(
+            f"<div style='background:var(--secondary-background-color);border-left:5px solid {lc};"
+            f"border-radius:8px;padding:12px 18px;margin-bottom:14px'>"
+            f"<span style='color:{lc};font-weight:bold;font-size:1.15rem'>🚦 宏觀燈號：{us_macro['light_name']}</span>"
+            f"<span style='color:{lc};font-size:0.9rem;margin-left:8px'>· {us_macro['light_desc']}</span>"
+            f"<div style='font-size:0.8rem;opacity:0.65;margin-top:6px'>{notes_txt}</div></div>",
+            unsafe_allow_html=True,
+        )
+
+        # ── 第一排：殖利率曲線 / Sahm Rule / 核心通膨 ──
+        r1c1, r1c2, r1c3 = st.columns(3)
+
+        with r1c1:  # 殖利率曲線（衰退預警）
+            d = ind["curve"]
+            if d:
+                inverted = d["value"] < 0
+                c = "#ef4444" if inverted else "#22c55e"
+                status = "倒掛（衰退預警）" if inverted else "正斜率（正常）"
+                st.markdown(_us_macro_card(
+                    "📐", "殖利率曲線 10Y-3M", f"{d['value']:+.2f}%", status, c,
+                    f"最新：{d['month']}", ), unsafe_allow_html=True)
+                st.plotly_chart(_us_macro_mini_line(d["history"], c,
+                    [(0, "#ef4444", "0 倒掛線")]), use_container_width=True)
+            else:
+                st.markdown(_us_macro_card("📐", "殖利率曲線 10Y-3M", "—", "資料取得失敗", "#888", ""),
+                            unsafe_allow_html=True)
+
+        with r1c2:  # Sahm Rule（衰退確認）
+            d = ind["sahm"]
+            if d:
+                triggered = d["value"] >= 0.5
+                c = "#dc2626" if triggered else "#22c55e"
+                status = "已觸發（衰退確認）" if triggered else "未觸發（未衰退）"
+                st.markdown(_us_macro_card(
+                    "🔔", "Sahm Rule 衰退指標", f"{d['value']:.2f}", status, c,
+                    f"最新：{d['month']} · 門檻 0.5", ), unsafe_allow_html=True)
+                st.plotly_chart(_us_macro_mini_line(d["history"], c,
+                    [(0.5, "#dc2626", "0.5 觸發")]), use_container_width=True)
+            else:
+                st.markdown(_us_macro_card("🔔", "Sahm Rule 衰退指標", "—", "資料取得失敗", "#888", ""),
+                            unsafe_allow_html=True)
+
+        with r1c3:  # 核心通膨（Fed 能否降息）
+            d = ind["cpi_yoy"]
+            if d:
+                v = d["value"]
+                c = "#ef4444" if v >= 3 else ("#22c55e" if v < 2.5 else "#eab308")
+                status = ("偏高，Fed 難降息" if v >= 3 else
+                          "溫和，降息空間大" if v < 2.5 else "中性")
+                st.markdown(_us_macro_card(
+                    "🔥", "核心通膨 CPI（年增）", f"{v:.1f}%", status, c,
+                    f"最新：{d['month']} · 目標 2%", ), unsafe_allow_html=True)
+                st.plotly_chart(_us_macro_mini_line(d["history"], c,
+                    [(2, "#22c55e", "2% 目標"), (3, "#ef4444", "3%")]), use_container_width=True)
+            else:
+                st.markdown(_us_macro_card("🔥", "核心通膨 CPI（年增）", "—", "資料取得失敗", "#888", ""),
+                            unsafe_allow_html=True)
+
+        # ── 第二排：失業率 / 聯邦基金利率 / WTI 油價 ──
+        r2c1, r2c2, r2c3 = st.columns(3)
+
+        with r2c1:  # 失業率
+            d = ind["unrate"]
+            if d:
+                rising = d["change"] is not None and d["change"] > 0
+                c = "#ef4444" if rising else "#22c55e"
+                chg_txt = (f"較上月 {'↑' if rising else '↓'} {abs(d['change']):.1f}"
+                           if d["change"] is not None else "")
+                st.markdown(_us_macro_card(
+                    "👷", "失業率", f"{d['value']:.1f}%",
+                    "上升中（景氣降溫）" if rising else "持平/下降", c,
+                    f"最新：{d['month']} · {chg_txt}", ), unsafe_allow_html=True)
+                st.plotly_chart(_us_macro_mini_line(d["history"], c), use_container_width=True)
+            else:
+                st.markdown(_us_macro_card("👷", "失業率", "—", "資料取得失敗", "#888", ""),
+                            unsafe_allow_html=True)
+
+        with r2c2:  # 聯邦基金利率
+            d = ind["ffr"]
+            if d:
+                c = "#3b82f6"
+                st.markdown(_us_macro_card(
+                    "🏦", "聯邦基金利率", f"{d['value']:.2f}%", "Fed 政策水位", c,
+                    f"最新：{d['month']}", ), unsafe_allow_html=True)
+                st.plotly_chart(_us_macro_mini_line(d["history"], c), use_container_width=True)
+            else:
+                st.markdown(_us_macro_card("🏦", "聯邦基金利率", "—", "資料取得失敗", "#888", ""),
+                            unsafe_allow_html=True)
+
+        with r2c3:  # WTI 油價
+            d = ind["wti"]
+            if d:
+                hot = d["value"] >= 90
+                c = "#ef4444" if hot else "#22c55e"
+                status = "偏高（供給通膨壓力）" if hot else "溫和"
+                st.markdown(_us_macro_card(
+                    "🛢️", "WTI 原油", f"${d['value']:.0f}", status, c,
+                    f"最新：{d['month']}", ), unsafe_allow_html=True)
+                st.plotly_chart(_us_macro_mini_line(d["history"], c,
+                    [(90, "#ef4444", "90")]), use_container_width=True)
+            else:
+                st.markdown(_us_macro_card("🛢️", "WTI 原油", "—", "資料取得失敗", "#888", ""),
+                            unsafe_allow_html=True)
+
+        # ── 背離 2×2 矩陣（宏觀寬鬆/緊縮 × 短線加倉/謹慎）──
+        macro_bullish = us_macro["macro_bullish"]
+        short_is_buy = "加倉" in rec_label
+        short_is_caution = any(k in rec_label for k in ("謹慎", "減倉", "危機"))
+        if short_is_buy:
+            active_cell = (macro_bullish, True)
+        elif short_is_caution:
+            active_cell = (macro_bullish, False)
+        else:
+            active_cell = None  # 觀望，不落入特定象限
+
+        _QUADRANT_NAMES = {
+            (True,  True):  "✅ 最強買點",
+            (False, True):  "⚡ 真實機會，需更高容忍度",
+            (True,  False): "📈 健康修正",
+            (False, False): "🛡️ 雙重警示",
+        }
+        if active_cell is not None:
+            macro_str = "宏觀寬鬆" if macro_bullish else "宏觀緊縮"
+            short_str = "短線加倉" if short_is_buy else "短線謹慎"
+            banner_html = (
+                f"<div style='background:var(--secondary-background-color);border-left:3px solid #6366f1;"
+                f"border-radius:8px;padding:8px 14px;margin:12px 0 8px;font-size:0.85rem'>"
+                f"<b>▶ 當前象限</b>：{macro_str}（{us_macro['light_name']}）× {short_str}（{rec_label}）"
+                f"→ <b>{_QUADRANT_NAMES[active_cell]}</b></div>"
+            )
+        else:
+            banner_html = (
+                "<div style='background:var(--secondary-background-color);border-left:3px solid #94a3b8;"
+                "border-radius:8px;padding:8px 14px;margin:12px 0 8px;font-size:0.85rem;opacity:0.7'>"
+                "目前短線信號觀望，不落入特定象限</div>"
+            )
+        st.markdown(
+            "<div style='margin:16px 0 4px;font-weight:bold;font-size:0.9rem'>宏觀與短線背離解讀"
+            "<span style='color:#94a3b8;font-size:0.78rem;font-weight:normal;margin-left:6px'>"
+            "（僅供參考，非投資建議）</span></div>",
+            unsafe_allow_html=True,
+        )
+        st.markdown(banner_html, unsafe_allow_html=True)
+
+        d1, d2 = st.columns(2)
+        d3, d4 = st.columns(2)
+        with d1:
+            st.markdown(_quad_card(
+                active_cell == (True, True),
+                "rgba(34,197,94,0.15)", "#16a34a",
+                "宏觀寬鬆 × 短線加倉", "#16a34a",
+                "✅ 最強買點", "流動性寬鬆＋市場恐慌，可順勢分批進場",
+            ), unsafe_allow_html=True)
+        with d2:
+            st.markdown(_quad_card(
+                active_cell == (False, True),
+                "rgba(249,115,22,0.15)", "#c2410c",
+                "宏觀緊縮 × 短線加倉", "#c2410c",
+                "⚡ 真實機會，需更高容忍度",
+                "升息/通膨壓力下抄底，回調可能更深、復原更慢",
+            ), unsafe_allow_html=True)
+        with d3:
+            st.markdown(_quad_card(
+                active_cell == (True, False),
+                "rgba(234,179,8,0.15)", "#a16207",
+                "宏觀寬鬆 × 短線謹慎", "#a16207",
+                "📈 健康修正", "寬鬆環境中的回調，可比平時更積極",
+            ), unsafe_allow_html=True)
+        with d4:
+            st.markdown(_quad_card(
+                active_cell == (False, False),
+                "rgba(239,68,68,0.15)", "#b91c1c",
+                "宏觀緊縮 × 短線謹慎", "#b91c1c",
+                "🛡️ 雙重警示", "緊縮＋短線轉弱，保持防禦、縮短操作週期",
+            ), unsafe_allow_html=True)
+        st.markdown(
+            "<div style='font-size:0.78rem;opacity:0.5;margin-top:10px'>"
+            "💡 宏觀影響你的「心理準備」與「等待時長」，不影響短線評分的進出場方向。<br>"
+            "資料來源：yfinance（殖利率/油價）· BLS 美國勞工局（失業率/核心CPI）· 月更/日更。</div>",
+            unsafe_allow_html=True,
+        )
+
+
 # ── 主程式 ──────────────────────────────────────────────────
 
 def main():
@@ -1122,6 +1901,7 @@ def main():
             st.rerun()
 
     tab_tw, tab_us = st.tabs(["📊 台股", "🇺🇸 美股"])
+    tab_crypto = None  # ₿ 加密 Tab 暫時隱藏，等 Realized Cap 資料來源修復後恢復
     rec_history = load_rec_history()
 
     # ════════════════════════════════════════════════════════
@@ -1129,16 +1909,17 @@ def main():
     # ════════════════════════════════════════════════════════
     with tab_tw:
         with st.spinner("載入台股資料（TAIFEX / TWSE / yfinance）…"):
-            tw_vix        = get_tw_vix_proxy()
-            tw_chips      = get_tw_chips()
-            tw_inst_cash  = get_tw_institutional_cash()
-            tw_margin     = get_tw_margin_history()
-            tw_breadth    = get_tw_market_breadth()
-            tw_credit     = get_tw_credit()
-            tw_cross      = get_tw_cross_assets()
-            tw_macro      = get_tw_macro_indicators()
-            tw_pmi        = get_tw_pmi()
-            tw_exports    = get_tw_export_orders()
+            _tw = _parallel_fetch({
+                "vix": get_tw_vix_proxy,        "chips": get_tw_chips,
+                "inst_cash": get_tw_institutional_cash, "margin": get_tw_margin_history,
+                "breadth": get_tw_market_breadth, "credit": get_tw_credit,
+                "cross": get_tw_cross_assets,    "macro": get_tw_macro_indicators,
+                "pmi": get_tw_pmi,               "exports": get_tw_export_orders,
+            })
+            tw_vix, tw_chips, tw_inst_cash = _tw["vix"], _tw["chips"], _tw["inst_cash"]
+            tw_margin, tw_breadth, tw_credit = _tw["margin"], _tw["breadth"], _tw["credit"]
+            tw_cross, tw_macro = _tw["cross"], _tw["macro"]
+            tw_pmi, tw_exports = _tw["pmi"], _tw["exports"]
 
         # ── 提前計算短線信號（供宏觀背離矩陣使用）──
         tw_rec_label, tw_rec_color, tw_rec_desc = calc_tw_recommendation(
@@ -1342,28 +2123,6 @@ def main():
                 unsafe_allow_html=True,
             )
             st.markdown(_banner_html, unsafe_allow_html=True)
-
-            def _quad_card(is_active, bg_rgba_base, border_color_hex, label, title_color, title_text, body_text):
-                """回傳背離矩陣格子 HTML；active 格子加重顯示"""
-                if is_active:
-                    bg      = bg_rgba_base.replace("0.15", "0.30")
-                    border  = f"2px solid {border_color_hex}"
-                    badge   = (f"<span style='float:right;background:{border_color_hex};color:#fff;"
-                               f"font-size:0.62rem;padding:2px 7px;border-radius:10px;font-weight:bold;margin-top:1px'>"
-                               f"▶ 當前</span>")
-                    dim     = ""
-                else:
-                    bg      = bg_rgba_base
-                    border  = f"1px solid {border_color_hex}66"
-                    badge   = ""
-                    dim     = "opacity:0.4;"
-                return (
-                    f"<div style='{dim}background:{bg};border:{border};"
-                    f"border-radius:8px;padding:12px'>"
-                    f"<div style='font-size:0.72rem;opacity:0.55;margin-bottom:4px'>{label}{badge}</div>"
-                    f"<div style='color:{title_color};font-weight:bold;font-size:0.9rem'>{title_text}</div>"
-                    f"<div style='font-size:0.8rem;margin-top:5px'>{body_text}</div></div>"
-                )
 
             d1, d2 = st.columns(2)
             d3, d4 = st.columns(2)
@@ -1977,12 +2736,35 @@ def main():
     # ════════════════════════════════════════════════════════
     with tab_us:
         with st.spinner("載入美股資料…"):
-            vix       = get_vix()
-            fg        = get_fear_greed()
-            breadth   = get_market_breadth()
-            credit    = get_credit()
-            cross     = get_cross_assets()
-            spx_trend = get_spx_trend()
+            # 宏觀一併放進並行批次：其內部 FRED 已改循序（避免並發被擋），
+            # 與其他來源並行不互相影響，最多同時 2 條 FRED 連線（macro+credit）
+            _us = _parallel_fetch({
+                "vix": get_vix,         "fg": get_fear_greed,
+                "breadth": get_market_breadth, "credit": get_credit,
+                "cross": get_cross_assets, "spx_trend": get_spx_trend,
+                "macro": get_us_macro,
+            })
+            vix, fg, breadth = _us["vix"], _us["fg"], _us["breadth"]
+            credit, cross, spx_trend = _us["credit"], _us["cross"], _us["spx_trend"]
+            us_macro = _us["macro"]   # 全失敗時 get_us_macro 拋例外 → _parallel_fetch 回 None
+
+        # ── 提前計算短線信號（供宏觀背離矩陣使用）──
+        rec_label, rec_color, rec_desc = calc_recommendation(
+            vix["current"]                     if vix     else None,
+            fg["score"]                        if fg      else None,
+            breadth["rsp_vs_spy"]              if breadth else None,
+            credit["hyg_5d"]                   if credit  else None,
+            credit["spread"]                   if credit  else None,
+            cross["latest"]["^TNX"]["chg_pct"] if cross   else None,
+            cross["latest"]["GLD"]["chg_pct"]  if cross   else None,
+            cross["latest"]["UUP"]["chg_pct"]  if cross   else None,
+            vix["max_5d"]            if vix       else None,
+            spx_trend["above_ma200"] if spx_trend else None,
+            spx_trend["ret_20d"]     if spx_trend else None,
+        )
+
+        # ── 宏觀背景（月更/日更，不影響短線評分）──
+        _render_us_macro_section(us_macro, rec_label)
 
         # ────────────────────────────────────────────────────
         # 第一行：VIX ／ 恐懼貪婪 ／ 市場廣度
@@ -2286,19 +3068,7 @@ def main():
             unsafe_allow_html=True,
         )
 
-        rec_label, rec_color, rec_desc = calc_recommendation(
-            vix["current"]                     if vix     else None,
-            fg["score"]                        if fg      else None,
-            breadth["rsp_vs_spy"]              if breadth else None,
-            credit["hyg_5d"]                   if credit  else None,
-            credit["spread"]                   if credit  else None,
-            cross["latest"]["^TNX"]["chg_pct"] if cross   else None,
-            cross["latest"]["GLD"]["chg_pct"]  if cross   else None,
-            cross["latest"]["UUP"]["chg_pct"]  if cross   else None,
-            vix["max_5d"]            if vix       else None,
-            spx_trend["above_ma200"] if spx_trend else None,
-            spx_trend["ret_20d"]     if spx_trend else None,
-        )
+        # rec_label / rec_color / rec_desc 已在 spinner 後提前計算
 
         # 六階段進度條：當前階段高亮，其餘淡化
         STAGES = [
@@ -2450,6 +3220,367 @@ def main():
 
         st.divider()
         _render_history_section(rec_history, market="us")
+
+    # ════════════════════════════════════════════════════════
+    # 加密貨幣 Tab（暫時隱藏；tab_crypto = None 時跳過整個區塊）
+    # ════════════════════════════════════════════════════════
+    if tab_crypto is not None:
+     with tab_crypto:
+        with st.spinner("載入加密指標（CoinMetrics / FRED / yfinance / alternative.me / CoinGecko）…"):
+            crypto = get_crypto()
+
+        _t, _i = st.columns([10, 2], vertical_alignment="center")
+        _t.subheader("₿ BTC 量化決策系統（免費版）", anchor=False)
+        with _i:
+            with st.popover("ℹ️"):
+                st.markdown("""
+**四層決策架構（由上至下）**
+
+| 層 | 指標 | 方向 |
+|----|------|------|
+| **L0 宏觀閘門** | US M2 YoY · Fed 資產負債表 MA4W | M2 收縮→加倉分×0.5 |
+| **L1 加倉面** | MVRV · Z-Score · NUPL · Realized比 · Puell · Mayer · F&G · AHR999 | 超跌→正分（滿分15） |
+| **L1 減倉面** | MVRV Z-Score · NUPL · Pi Cycle Top | 過熱→正分（滿分6） |
+| **L2 衍生品** | 資金費率年化 · F&G 高位 | 槓桿過熱→減倉加分（滿分4） |
+
+**決策（減倉優先）：** 減倉分≥8→考慮減倉；≥5→偏向謹慎；≥3→暫停加倉。
+加倉有效分≥9→重倉加倉；≥6→階梯加倉；≥3→基礎定投；其餘→觀望。
+
+資料來源：CoinMetrics Community（免費）· FRED · yfinance · alternative.me · CoinGecko。
+                """)
+
+        if crypto and any(crypto.get(k) is not None for k in ("mvrv", "mayer", "cfg", "btc_price")):
+
+            # ── BTC 現況列（5 個關鍵指標）──────────────────────
+            kc1, kc2, kc3, kc4, kc5 = st.columns(5)
+            with kc1:
+                px = crypto.get("btc_price")
+                bd = crypto.get("btc_dom")
+                st.metric("BTC 現價", f"${px:,.0f}" if px else "—",
+                          f"主導率 {bd:.1f}%" if bd else None, delta_color="off")
+            with kc2:
+                mm = crypto.get("mayer")
+                if mm is not None:
+                    mm_clr = "#22c55e" if mm <= 0.8 else ("#ef4444" if mm >= 2.4 else "#f59e0b")
+                    st.metric("Mayer 倍數", f"{mm:.2f}")
+                    note = ("超跌區" if mm <= 0.8 else "高估區" if mm >= 2.4 else
+                            "跌破均線" if mm < 1.0 else "均線上方")
+                    st.markdown(f"<span style='color:{mm_clr};font-weight:bold'>▌ {note}</span>",
+                                unsafe_allow_html=True)
+                else:
+                    st.metric("Mayer 倍數", "—")
+            with kc3:
+                mv = crypto.get("mvrv")
+                if mv is not None:
+                    mv_clr = "#22c55e" if mv <= 1.0 else ("#ef4444" if mv >= 3.5 else "#f59e0b")
+                    st.metric("MVRV 比值", f"{mv:.2f}")
+                    note = ("深度超跌" if mv <= 1.0 else "偏低" if mv <= 1.2 else
+                            "偏高" if mv >= 3.5 else "中性")
+                    st.markdown(f"<span style='color:{mv_clr};font-weight:bold'>▌ {note}</span>",
+                                unsafe_allow_html=True)
+                else:
+                    st.metric("MVRV 比值", "—")
+            with kc4:
+                rr = crypto.get("realized_ratio")
+                rp = crypto.get("realized_price")
+                if rr is not None:
+                    rr_clr = "#22c55e" if rr <= 1.0 else ("#ef4444" if rr >= 5.0 else "#f59e0b")
+                    st.metric("現價/Realized", f"{rr:.2f}×",
+                              f"已實現 ${rp:,.0f}" if rp else None, delta_color="off")
+                    note = "貼近成本區" if rr <= 1.08 else ("過熱" if rr >= 5 else "中性")
+                    st.markdown(f"<span style='color:{rr_clr};font-weight:bold'>▌ {note}</span>",
+                                unsafe_allow_html=True)
+                else:
+                    st.metric("現價/Realized", "—")
+            with kc5:
+                pu = crypto.get("puell")
+                if pu is not None:
+                    pu_clr = "#22c55e" if pu <= 0.5 else ("#ef4444" if pu >= 4.0 else "#f59e0b")
+                    st.metric("Puell Multiple", f"{pu:.2f}")
+                    note = ("礦工承壓（底部）" if pu <= 0.5 else
+                            "過熱（礦工暴利）" if pu >= 4.0 else "中性")
+                    st.markdown(f"<span style='color:{pu_clr};font-weight:bold'>▌ {note}</span>",
+                                unsafe_allow_html=True)
+                else:
+                    st.metric("Puell Multiple", "—")
+
+            # ── L0 宏觀閘門橫幅 ────────────────────────────────
+            m2_yoy     = crypto.get("m2_yoy")
+            m2_expand  = crypto.get("m2_expanding")
+            fed_ma4w   = crypto.get("fed_bs_ma4w")
+            fed_expand = crypto.get("fed_bs_expanding")
+            m2_mult    = 0.5 if (m2_expand is not None and not m2_expand) else 1.0
+            m2_str  = f"{m2_yoy:+.1f}% YoY" if m2_yoy is not None else "載入中"
+            fed_str = f"MA4W {fed_ma4w:.2f}兆" if fed_ma4w is not None else "載入中"
+            l0_open = m2_expand is not False   # None 視為中性（不扣分）
+            l0_clr  = "#22c55e" if l0_open else "#ef4444"
+            l0_icon = "🟢" if l0_open else "🔴"
+            l0_tag  = f"加倉係數 <b>×{m2_mult}</b>" + ("（M2 收縮，加倉訊號減半）" if m2_mult < 1 else "（M2 擴張，正常加倉）")
+            m2_fed_icon = ("📈" if fed_expand else "📉") if fed_expand is not None else "⏳"
+            st.markdown(
+                f"""<div style="background:{l0_clr}18;border:1.5px solid {l0_clr}55;
+                    border-radius:10px;padding:10px 20px;margin:10px 0;">
+                    <b>{l0_icon} L0 宏觀閘門</b> &nbsp;|&nbsp;
+                    US M2：<b style='color:{l0_clr}'>{m2_str}</b> &nbsp;|&nbsp;
+                    Fed 資產負債表：<b>{fed_str}</b> {m2_fed_icon} &nbsp;|&nbsp;
+                    {l0_tag}
+                </div>""",
+                unsafe_allow_html=True,
+            )
+
+            st.divider()
+
+            # ── 評分計算 ──────────────────────────────────────
+            crec_label, crec_color, crec_desc, buy_adj, sell_score = calc_crypto_recommendation(crypto)
+
+            # 個別買方指標分（供面板展示；與 calc_crypto_recommendation 邏輯保持同步）
+            def _bscore(key, thresholds):
+                """thresholds: list of (比較值, 得分)，按優先順序排"""
+                v = crypto.get(key)
+                if v is None:
+                    return v, 0
+                for thr, sc in thresholds:
+                    if v <= thr:
+                        return v, sc
+                return v, 0
+            def _bscore_cfg(v, thresholds):
+                if v is None:
+                    return 0
+                for thr, sc in thresholds:
+                    if v < thr:
+                        return sc
+                return 0
+
+            mvrv_v, mvrv_sc = _bscore("mvrv", [(1.0, 2), (1.2, 1)])
+            mvrv_z_v, mvrv_z_sc = _bscore("mvrv_zscore", [(0.1, 2), (0.5, 1)])
+            nupl_v, nupl_sc = _bscore("nupl_approx", [(0, 2), (0.25, 1)])
+            rr_v, rr_sc    = _bscore("realized_ratio", [(1.0, 2), (1.08, 1)])
+            pu_v, pu_sc    = _bscore("puell", [(0.5, 2), (0.8, 1)])
+            may_v, may_sc  = _bscore("mayer", [(0.8, 2), (1.0, 1)])
+            cfg_v = crypto.get("cfg")
+            cfg_buy_sc = _bscore_cfg(cfg_v, [(15, 2), (25, 1)])
+            ahr_v = crypto.get("ahr999_approx")
+            ahr_sc = (1 if ahr_v is not None and ahr_v <= 0.45 else
+                      0.5 if ahr_v is not None and ahr_v <= 1.2 else 0)
+            buy_raw = mvrv_sc + mvrv_z_sc + nupl_sc + rr_sc + pu_sc + may_sc + cfg_buy_sc + ahr_sc
+
+            # 個別賣方指標分
+            mvrv_z_sell = (2 if mvrv_z_v is not None and mvrv_z_v >= 6.0 else
+                           1 if mvrv_z_v is not None and mvrv_z_v >= 4.0 else 0)
+            nupl_sell   = (2 if nupl_v is not None and nupl_v >= 0.75 else
+                           1 if nupl_v is not None and nupl_v >= 0.5 else 0)
+            pi_sell     = (2 if crypto.get("pi_cross") else
+                           1 if crypto.get("pi_warning") else 0)
+            cfg_sell_sc = (2 if cfg_v is not None and cfg_v >= 85 else
+                           1 if cfg_v is not None and cfg_v >= 80 else 0)
+            fr = crypto.get("funding")
+            fr_ann = (fr * 3 * 365 * 100) if fr is not None else None
+            fr_sell = (2 if fr_ann is not None and fr_ann >= 50 else
+                       1 if fr_ann is not None and fr_ann >= 30 else 0)
+
+            # ── 評分面板（買方 + 賣方）────────────────────────
+            def _row(name, stars, val_str, sc, max_sc, status, s_clr=""):
+                badge_clr = ("#22c55e" if sc >= max_sc else
+                             "#eab308" if sc > 0 else "#94a3b8")
+                sc_str = f"+{sc:.4g}" if sc > 0 else f"{sc:.4g}"
+                row_clr = s_clr or ("#22c55e" if sc >= max_sc else
+                                    "#eab308" if sc > 0 else "#94a3b8")
+                return (
+                    f"<tr style='border-bottom:1px solid rgba(255,255,255,0.07)'>"
+                    f"<td style='padding:7px 6px;font-size:0.82rem'><b>{name}</b>"
+                    f" <span style='opacity:0.4;font-size:0.7rem'>{stars}</span></td>"
+                    f"<td style='padding:7px 6px;text-align:right;font-size:0.82rem;"
+                    f"opacity:0.75'>{val_str}</td>"
+                    f"<td style='padding:7px 6px;font-size:0.78rem;color:{row_clr}'>{status}</td>"
+                    f"<td style='padding:7px 6px;text-align:right'>"
+                    f"<span style='color:{badge_clr};font-weight:700;font-size:0.82rem'>"
+                    f"{sc_str}/{max_sc}</span></td></tr>"
+                )
+
+            tbl_style = ("width:100%;border-collapse:collapse;"
+                         "background:rgba(255,255,255,0.03);border-radius:8px;"
+                         "overflow:hidden;")
+
+            # 買方面板
+            buy_col, sell_col = st.columns([3, 2])
+            with buy_col:
+                st.markdown(f"**📈 加倉評分（L1）**　<span style='font-size:0.8rem;color:#94a3b8'>"
+                            f"原始 {buy_raw:.1f}/15 → 有效 {buy_adj:.1f}/15（×{m2_mult}）</span>",
+                            unsafe_allow_html=True)
+                b_rows = (
+                    _row("MVRV",         "★★★",
+                         f"{mvrv_v:.2f}" if mvrv_v else "—",
+                         mvrv_sc, 2,
+                         "深度超跌" if mvrv_sc == 2 else "偏低" if mvrv_sc == 1 else "中性/過熱")
+                  + _row("MVRV Z-Score", "★★★",
+                         f"{mvrv_z_v:.2f}" if mvrv_z_v is not None else "—",
+                         mvrv_z_sc, 2,
+                         "歷史底部" if mvrv_z_sc == 2 else "偏低" if mvrv_z_sc == 1 else "中性")
+                  + _row("NUPL（近似）",  "★★★",
+                         f"{nupl_v:.3f}" if nupl_v is not None else "—",
+                         nupl_sc, 2,
+                         "投降區" if nupl_sc == 2 else "希望區" if nupl_sc == 1 else "中性/過熱")
+                  + _row("現價/Realized", "★★",
+                         f"{rr_v:.3f}" if rr_v is not None else "—",
+                         rr_sc, 2,
+                         "貼近成本" if rr_sc == 2 else "接近成本" if rr_sc == 1 else "中性")
+                  + _row("Puell Multiple","★★",
+                         f"{pu_v:.2f}" if pu_v is not None else "—",
+                         pu_sc, 2,
+                         "礦工承壓" if pu_sc == 2 else "偏低" if pu_sc == 1 else "中性")
+                  + _row("Mayer 倍數",   "★★",
+                         f"{may_v:.2f}" if may_v is not None else "—",
+                         may_sc, 2,
+                         "超跌" if may_sc == 2 else "跌破均線" if may_sc == 1 else "均線上方")
+                  + _row("加密 F&G",     "★★",
+                         str(cfg_v) if cfg_v is not None else "—",
+                         cfg_buy_sc, 2,
+                         "極度恐懼" if cfg_buy_sc == 2 else "恐懼" if cfg_buy_sc == 1 else "中性/貪婪")
+                  + _row("AHR999（近似）","★",
+                         f"{ahr_v:.2f}" if ahr_v is not None else "—",
+                         ahr_sc, 1,
+                         "定投區" if ahr_sc == 1 else "偏低" if ahr_sc == 0.5 else "中性/過熱")
+                )
+                st.markdown(
+                    f'<table style="{tbl_style}">{b_rows}</table>',
+                    unsafe_allow_html=True,
+                )
+
+            # 賣方面板
+            with sell_col:
+                st.markdown(f"**📉 減倉評分（L1/L2）**　<span style='font-size:0.8rem;color:#94a3b8'>"
+                            f"減倉分 {sell_score}/10</span>",
+                            unsafe_allow_html=True)
+                # Pi Cycle 顯示值
+                pi111 = crypto.get("pi_111dma")
+                pi350 = crypto.get("pi_350x2")
+                pi_val_str = (f"{pi111:,.0f} vs {pi350:,.0f}" if pi111 and pi350 else "—")
+                pi_status = ("已穿越！頂部訊號" if pi_sell == 2 else
+                             "接近穿越（警戒）" if pi_sell == 1 else "安全距離")
+                cfg_sell_status = ("極度貪婪" if cfg_sell_sc == 2 else
+                                   "高度貪婪" if cfg_sell_sc == 1 else "中性/恐懼")
+                fr_str = f"{fr_ann:.0f}%" if fr_ann is not None else "—"
+                fr_status = ("費率過熱" if fr_sell == 2 else "偏高" if fr_sell == 1 else "正常")
+                s_rows = (
+                    _row("MVRV Z-Score", "★★★",
+                         f"{mvrv_z_v:.2f}" if mvrv_z_v is not None else "—",
+                         mvrv_z_sell, 2,
+                         "頂部過熱" if mvrv_z_sell == 2 else "偏高" if mvrv_z_sell == 1 else "安全",
+                         s_clr="#ef4444" if mvrv_z_sell else "")
+                  + _row("NUPL（近似）", "★★★",
+                         f"{nupl_v:.3f}" if nupl_v is not None else "—",
+                         nupl_sell, 2,
+                         "信念/歡欣頂部" if nupl_sell == 2 else "偏高" if nupl_sell == 1 else "安全",
+                         s_clr="#ef4444" if nupl_sell else "")
+                  + _row("Pi Cycle Top", "★★★",
+                         pi_val_str, pi_sell, 2, pi_status,
+                         s_clr="#ef4444" if pi_sell == 2 else "#f97316" if pi_sell == 1 else "")
+                  + _row("加密 F&G 高位","★★",
+                         str(cfg_v) if cfg_v is not None else "—",
+                         cfg_sell_sc, 2, cfg_sell_status,
+                         s_clr="#ef4444" if cfg_sell_sc else "")
+                  + _row("費率（年化）", "★★",
+                         fr_str, fr_sell, 2, fr_status,
+                         s_clr="#ef4444" if fr_sell == 2 else "#f97316" if fr_sell == 1 else "")
+                )
+                st.markdown(
+                    f'<table style="{tbl_style}">{s_rows}</table>',
+                    unsafe_allow_html=True,
+                )
+
+            st.divider()
+
+            # ── 六段綜合建議 ────────────────────────────────
+            st.markdown(
+                "<div style='display:flex; align-items:baseline; gap:8px; margin-bottom:8px;'>"
+                "<span style='font-size:1.3rem; font-weight:700;'>🎯 BTC 綜合建議</span>"
+                "<span style='color:#94a3b8; font-size:0.8rem;'>（僅供參考，非投資建議）</span>"
+                "</div>",
+                unsafe_allow_html=True,
+            )
+
+            CSTAGES = [
+                ("🔴 考慮減倉", "#ef4444"),
+                ("🟠 偏向謹慎", "#f97316"),
+                ("⏸️ 觀望",    "#94a3b8"),
+                ("🟡 基礎定投", "#eab308"),
+                ("🟢 階梯加倉", "#84cc16"),
+                ("✅ 重倉加倉", "#22c55e"),
+            ]
+            cards = ""
+            for lbl, clr in CSTAGES:
+                if lbl == crec_label:
+                    style = (
+                        f"flex:1;text-align:center;padding:10px 4px;border-radius:10px;"
+                        f"background:{clr}33;border:2px solid {clr};"
+                        f"color:{clr};font-weight:bold;font-size:0.82rem;"
+                    )
+                else:
+                    style = (
+                        "flex:1;text-align:center;padding:10px 4px;border-radius:10px;"
+                        "background:rgba(255,255,255,0.03);border:1px solid rgba(255,255,255,0.12);"
+                        "color:#888;font-size:0.79rem;"
+                    )
+                cards += f'<div style="{style}">{lbl}</div>'
+            st.markdown(
+                f'<div style="display:flex;gap:6px;margin:14px 0 10px 0;">{cards}</div>',
+                unsafe_allow_html=True,
+            )
+            st.markdown(
+                f'<div style="background:{crec_color}22;border:2px solid {crec_color};'
+                f'border-radius:12px;padding:14px 24px;text-align:center;margin:0 0 18px 0;">'
+                f'<span style="font-size:1.1rem;font-weight:700">{crec_desc}</span></div>',
+                unsafe_allow_html=True,
+            )
+
+            with st.expander("📖 評分基準與指標說明"):
+                st.markdown("""
+**L1 加倉面（滿分 15 分）**
+
+| 指標 | 加倉條件 | 分數 |
+|------|---------|:----:|
+| MVRV ★★★ | ≤1.0（深度超跌）/ ≤1.2（偏低） | +2 / +1 |
+| MVRV Z-Score ★★★ | ≤0.1（歷史底部）/ ≤0.5（偏低） | +2 / +1 |
+| NUPL近似 ★★★ | ≤0（投降）/ ≤0.25（希望） | +2 / +1 |
+| 現價/Realized ★★ | ≤1.0（貼成本）/ ≤1.08（接近） | +2 / +1 |
+| Puell Multiple ★★ | ≤0.5（礦工承壓）/ ≤0.8（偏低） | +2 / +1 |
+| Mayer 倍數 ★★ | ≤0.8（超跌）/ ≤1.0（跌破均線） | +2 / +1 |
+| 加密 F&G ★★ | <15（極度恐懼）/ <25（恐懼） | +2 / +1 |
+| AHR999近似 ★ | ≤0.45（定投區）/ ≤1.2（偏低） | +1 / +0.5 |
+
+**L1/L2 減倉面（滿分 10 分）**
+
+| 指標 | 減倉條件 | 分數 |
+|------|---------|:----:|
+| MVRV Z-Score ★★★ | ≥6.0（歷史頂部）/ ≥4.0（偏高） | +2 / +1 |
+| NUPL近似 ★★★ | ≥0.75（歡欣頂部）/ ≥0.5（信念） | +2 / +1 |
+| Pi Cycle Top ★★★ | 111DMA 穿越 350DMA×2 / 接近5%以內 | +2 / +1 |
+| 加密 F&G 高位 ★★ | ≥85（極度貪婪）/ ≥80（高度貪婪） | +2 / +1 |
+| 費率年化 ★★ | ≥50%（過熱）/ ≥30%（偏高） | +2 / +1 |
+
+**決策（減倉優先）：**
+減倉分≥8→考慮減倉；≥5→偏向謹慎；≥3→觀望。
+有效加倉分≥9→重倉加倉（費率年化<30%）；≥6→階梯加倉；≥3→基礎定投。
+L0：US M2 YoY<0 時加倉有效分乘以 0.5。
+                """)
+
+            # 加密恐懼貪婪歷史走勢（保留輔助圖）
+            if crypto.get("cfg_hist") is not None and len(crypto["cfg_hist"]) > 1:
+                st.divider()
+                st.caption("加密恐懼貪婪指數 30 日走勢")
+                fig = mini_chart(
+                    {"加密恐懼貪婪": (crypto["cfg_hist"], "#a855f7")},
+                    h_lines=[
+                        (80, "dash", "#ef4444", "80 極度貪婪"),
+                        (25, "dash", "#22c55e", "25 恐懼"),
+                    ],
+                )
+                st.plotly_chart(fig, use_container_width=True)
+
+            st.divider()
+            _render_history_section(rec_history, market="crypto")
+        else:
+            st.error("加密指標載入失敗（CoinMetrics / yfinance 等外部 API 暫時無法連線），請稍後重試")
 
 
 if __name__ == "__main__":
