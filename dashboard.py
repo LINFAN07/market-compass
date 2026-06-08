@@ -831,7 +831,8 @@ def get_tw_cross_assets():
 
 @st.cache_data(ttl=86400, show_spinner=False)
 def get_tw_macro_indicators():
-    """景氣對策信號燈（國發會，月更）"""
+    """景氣對策信號燈（國發會，月更） — 含重試機制"""
+    import time
     LIGHT_INFO = {
         1: ("紅燈",   "景氣過熱", "#ef4444"),
         2: ("黃紅燈", "景氣趨熱", "#f97316"),
@@ -846,80 +847,105 @@ def get_tw_macro_indicators():
         if s <= 37: return 2
         return 1
 
-    try:
-        session = requests.Session()
-        hdrs = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
-        r = session.get("https://index.ndc.gov.tw/n/zh_tw", headers=hdrs, timeout=10)
-        m = re.search(r'<meta name="csrf-token" content="([^"]+)"', r.text)
-        if not m:
-            return None
-        csrf = m.group(1)
-        post_hdrs = {**hdrs, "X-CSRF-TOKEN": csrf,
-                     "X-Requested-With": "XMLHttpRequest",
-                     "Content-Type": "application/json",
-                     "Referer": "https://index.ndc.gov.tw/n/zh_tw"}
-        r2 = session.post("https://index.ndc.gov.tw/n/json/lightscore",
-                          headers=post_hdrs, timeout=10)
-        data = r2.json()
-        line_data = data.get("line", [])
-        if not line_data:
-            return None
-        latest   = line_data[-1]
-        score    = latest["y"]
-        x        = latest["x"]
-        month    = f"{x[:4]}-{x[4:]}"
-        light_n  = score_to_light(score)
-        name, desc, color = LIGHT_INFO[light_n]
-        months  = [f"{d['x'][:4]}-{d['x'][4:]}" for d in line_data]
-        scores  = [d["y"] for d in line_data]
-        history = pd.Series(scores, index=pd.to_datetime(months))
-        return {
-            "month": month, "score": score,
-            "light_name": name, "light_desc": desc, "light_color": color,
-            "history": history, "next_release": data.get("next", ""),
-        }
-    except Exception:
-        return None
+    for attempt in range(3):  # 最多重試 3 次
+        try:
+            session = requests.Session()
+            hdrs = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+            r = session.get("https://index.ndc.gov.tw/n/zh_tw", headers=hdrs, timeout=15)
+            r.raise_for_status()
+            m = re.search(r'<meta name="csrf-token" content="([^"]+)"', r.text)
+            if not m:
+                if attempt < 2:
+                    time.sleep(1)
+                    continue
+                return None
+            csrf = m.group(1)
+            post_hdrs = {**hdrs, "X-CSRF-TOKEN": csrf,
+                         "X-Requested-With": "XMLHttpRequest",
+                         "Content-Type": "application/json",
+                         "Referer": "https://index.ndc.gov.tw/n/zh_tw"}
+            time.sleep(0.5)  # 避免被擋
+            r2 = session.post("https://index.ndc.gov.tw/n/json/lightscore",
+                              headers=post_hdrs, timeout=15)
+            r2.raise_for_status()
+            data = r2.json()
+            line_data = data.get("line", [])
+            if not line_data:
+                if attempt < 2:
+                    time.sleep(1)
+                    continue
+                return None
+            latest   = line_data[-1]
+            score    = latest["y"]
+            x        = latest["x"]
+            month    = f"{x[:4]}-{x[4:]}"
+            light_n  = score_to_light(score)
+            name, desc, color = LIGHT_INFO[light_n]
+            months  = [f"{d['x'][:4]}-{d['x'][4:]}" for d in line_data]
+            scores  = [d["y"] for d in line_data]
+            history = pd.Series(scores, index=pd.to_datetime(months))
+            return {
+                "month": month, "score": score,
+                "light_name": name, "light_desc": desc, "light_color": color,
+                "history": history, "next_release": data.get("next", ""),
+            }
+        except Exception as e:
+            if attempt < 2:
+                time.sleep(1)
+    return None
 
 
 @st.cache_data(ttl=86400, show_spinner=False)
 def get_tw_pmi():
-    """台灣製造業 PMI（國發會，月更）"""
-    try:
-        session = requests.Session()
-        hdrs = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
-        r = session.get("https://index.ndc.gov.tw/n/zh_tw/PMI", headers=hdrs, timeout=10)
-        m = re.search(r'<meta name="csrf-token" content="([^"]+)"', r.text)
-        if not m:
-            return None
-        csrf = m.group(1)
-        post_hdrs = {**hdrs, "X-CSRF-TOKEN": csrf,
-                     "X-Requested-With": "XMLHttpRequest",
-                     "Content-Type": "application/json",
-                     "Referer": "https://index.ndc.gov.tw/n/zh_tw/PMI"}
-        r2 = session.post("https://index.ndc.gov.tw/n/json/PMI",
-                          headers=post_hdrs, timeout=10)
-        data = r2.json()
-        # key "55" = 製造業PMI(季調值)
-        pmi_d = data.get("right", {}).get("55", {}).get("d", [])
-        if not pmi_d:
-            return None
-        latest  = pmi_d[-1]
-        value   = latest["n"]
-        x       = latest["m"]
-        month   = f"{x[:4]}-{x[4:]}"
-        prev    = pmi_d[-2]["n"] if len(pmi_d) >= 2 else None
-        change  = round(value - prev, 1) if prev is not None else None
-        expanding = value >= 50
-        color   = "#22c55e" if expanding else "#ef4444"
-        status  = "擴張" if expanding else "收縮"
-        return {
-            "value": value, "month": month, "prev": prev,
-            "change": change, "status": status, "color": color,
-            "next_release": data.get("next", ""),
-        }
-    except Exception:
-        return None
+    """台灣製造業 PMI（國發會，月更） — 含重試機制"""
+    import time
+    for attempt in range(3):  # 最多重試 3 次
+        try:
+            session = requests.Session()
+            hdrs = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+            r = session.get("https://index.ndc.gov.tw/n/zh_tw/PMI", headers=hdrs, timeout=15)
+            r.raise_for_status()
+            m = re.search(r'<meta name="csrf-token" content="([^"]+)"', r.text)
+            if not m:
+                if attempt < 2:
+                    time.sleep(1)
+                    continue
+                return None
+            csrf = m.group(1)
+            post_hdrs = {**hdrs, "X-CSRF-TOKEN": csrf,
+                         "X-Requested-With": "XMLHttpRequest",
+                         "Content-Type": "application/json",
+                         "Referer": "https://index.ndc.gov.tw/n/zh_tw/PMI"}
+            time.sleep(0.5)  # 避免被擋
+            r2 = session.post("https://index.ndc.gov.tw/n/json/PMI",
+                              headers=post_hdrs, timeout=15)
+            r2.raise_for_status()
+            data = r2.json()
+            # key "55" = 製造業PMI(季調值)
+            pmi_d = data.get("right", {}).get("55", {}).get("d", [])
+            if not pmi_d:
+                if attempt < 2:
+                    time.sleep(1)
+                    continue
+                return None
+            latest  = pmi_d[-1]
+            value   = latest["n"]
+            x       = latest["m"]
+            month   = f"{x[:4]}-{x[4:]}"
+            prev    = pmi_d[-2]["n"] if len(pmi_d) >= 2 else None
+            change  = round(value - prev, 1) if prev is not None else None
+            expanding = value >= 50
+            color   = "#22c55e" if expanding else "#ef4444"
+            status  = "擴張" if expanding else "收縮"
+            return {
+                "value": value, "month": month, "prev": prev,
+                "change": change, "status": status, "color": color,
+                "next_release": data.get("next", ""),
+            }
+        except Exception as e:
+            if attempt < 2:
+                time.sleep(1)
+    return None
 
 
 @st.cache_data(ttl=28800, show_spinner=False)
@@ -1067,43 +1093,96 @@ def get_us_macro():
 
 @st.cache_data(ttl=86400, show_spinner=False)
 def get_tw_export_orders():
-    """電子產品外銷訂單年增率（經濟部，月更）"""
-    try:
-        from io import StringIO
-        hdrs = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
-        r = requests.get("https://service.moea.gov.tw/EE521/common/Common.aspx?code=B&no=9",
-                         headers=hdrs, timeout=10)
-        tables = pd.read_html(StringIO(r.text))
-        df = tables[0]
-        df.columns = ["year", "month_raw", "total", "cn_hk", "us", "eu", "jp", "other", "_"]
-        df["year"] = df["year"].ffill()
-        # 去掉 NaN 與累計行（月份含 -，如「1-4月」）
-        df2 = df.dropna(subset=["total"])
-        df2 = df2[~df2["month_raw"].astype(str).str.contains(r"-\d", na=False)]
-        df2 = df2.copy()
-        df2["roc"] = df2["year"].apply(
-            lambda x: int(re.findall(r"\d+", str(x))[0]) if re.findall(r"\d+", str(x)) else None)
-        df2["mon"] = df2["month_raw"].apply(
-            lambda x: int(re.findall(r"\d+", str(x))[0]) if re.findall(r"\d+", str(x)) else None)
-        df2["val"] = pd.to_numeric(
-            df2["total"].astype(str).str.replace(r"\s+", "", regex=True), errors="coerce")
-        df2 = df2.dropna(subset=["roc", "mon", "val"])
-        if df2.empty:
-            return None
-        last = df2.iloc[-1]
-        ad_year  = int(last["roc"]) + 1911
-        month    = f"{ad_year}-{int(last['mon']):02d}"
-        value    = float(last["val"])
-        # 12 個月歷史
-        history_dates = [f"{int(r)+1911}-{int(m):02d}" for r, m in zip(df2["roc"], df2["mon"])]
-        history = pd.Series(df2["val"].values, index=pd.to_datetime(history_dates))
-        color   = "#22c55e" if value >= 0 else "#ef4444"
-        return {
-            "value": round(value, 1), "month": month,
-            "history": history.tail(12), "color": color,
-        }
-    except Exception:
-        return None
+    """電子產品外銷訂單年增率（經濟部，月更） — 含重試機制"""
+    import time
+    from io import StringIO
+
+    for attempt in range(3):  # 最多重試 3 次
+        try:
+            hdrs = {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "Accept-Language": "zh-TW,zh;q=0.9,en;q=0.8",
+            }
+            r = requests.get(
+                "https://service.moea.gov.tw/EE521/common/Common.aspx?code=B&no=9",
+                headers=hdrs, timeout=15)
+            r.raise_for_status()
+
+            # 改善 HTML 解析：嘗試多個表格位置
+            tables = pd.read_html(StringIO(r.text))
+            if not tables:
+                if attempt < 2:
+                    time.sleep(1)
+                    continue
+                return None
+
+            df = tables[0]
+            # 動態列名（防止網站改版）
+            if len(df.columns) < 3:
+                if attempt < 2:
+                    time.sleep(1)
+                    continue
+                return None
+
+            # 取前幾列作為欄名
+            if pd.isna(df.iloc[0, 0]):
+                df.columns = df.iloc[0]
+                df = df.iloc[1:].reset_index(drop=True)
+
+            df_clean = df.copy()
+            df_clean.columns = ["year", "month_raw"] + list(df_clean.columns[2:])
+            df_clean["year"] = df_clean["year"].ffill()
+
+            # 去掉 NaN 與累計行
+            df2 = df_clean.dropna(subset=[df_clean.columns[2]])  # 第一個數值欄
+            if df2.empty:
+                if attempt < 2:
+                    time.sleep(1)
+                    continue
+                return None
+
+            df2 = df2[~df2["month_raw"].astype(str).str.contains(r"-\d", na=False)]
+            df2 = df2.copy()
+
+            # 提取年份和月份
+            df2["roc"] = df2["year"].apply(
+                lambda x: int(re.findall(r"\d+", str(x))[0]) if re.findall(r"\d+", str(x)) else None)
+            df2["mon"] = df2["month_raw"].apply(
+                lambda x: int(re.findall(r"\d+", str(x))[0]) if re.findall(r"\d+", str(x)) else None)
+
+            # 提取數值（嘗試第一個數值欄）
+            val_col = df_clean.columns[2]
+            df2["val"] = pd.to_numeric(
+                df2[val_col].astype(str).str.replace(r"\s+|%|,", "", regex=True),
+                errors="coerce")
+
+            df2 = df2.dropna(subset=["roc", "mon", "val"])
+            if df2.empty:
+                if attempt < 2:
+                    time.sleep(1)
+                    continue
+                return None
+
+            last = df2.iloc[-1]
+            ad_year  = int(last["roc"]) + 1911
+            month    = f"{ad_year}-{int(last['mon']):02d}"
+            value    = float(last["val"])
+
+            # 12 個月歷史
+            history_dates = [f"{int(r)+1911}-{int(m):02d}" for r, m in zip(df2["roc"], df2["mon"])]
+            history = pd.Series(df2["val"].values, index=pd.to_datetime(history_dates))
+            color   = "#22c55e" if value >= 0 else "#ef4444"
+
+            return {
+                "value": round(value, 1), "month": month,
+                "history": history.tail(12), "color": color,
+            }
+        except Exception as e:
+            if attempt < 2:
+                time.sleep(1)
+
+    return None
 
 
 # ── 每日建議歷史（從 GitHub Gist 讀取）─────────────────────
