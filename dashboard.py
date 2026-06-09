@@ -1104,13 +1104,16 @@ def get_tw_export_orders():
                 "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
                 "Accept-Language": "zh-TW,zh;q=0.9,en;q=0.8",
             }
+            print(f"[export_orders] 第 {attempt+1} 次嘗試...")
             r = requests.get(
                 "https://service.moea.gov.tw/EE521/common/Common.aspx?code=B&no=9",
                 headers=hdrs, timeout=15)
             r.raise_for_status()
+            print(f"[export_orders] HTTP 200，解析 HTML...")
 
             # 改善 HTML 解析：嘗試多個表格位置
             tables = pd.read_html(StringIO(r.text))
+            print(f"[export_orders] 抓取 {len(tables)} 個表格")
             if not tables:
                 if attempt < 2:
                     time.sleep(1)
@@ -1118,47 +1121,68 @@ def get_tw_export_orders():
                 return None
 
             df = tables[0]
-            # 動態列名（防止網站改版）
-            if len(df.columns) < 3:
+            print(f"[export_orders] 表格 columns={list(df.columns)[:5]}, shape={df.shape}")
+
+            # 簡化邏輯：找最後一個有有效數據的行（通常是最新月份）
+            # 先把所有數值欄都試著轉成 numeric
+            df_work = df.copy()
+
+            # 嘗試尋找「年」或年份相關列
+            year_col = None
+            for col in df_work.columns:
+                if '年' in str(col) or col == 0:
+                    year_col = col
+                    break
+
+            if year_col is None:
+                year_col = df_work.columns[0]
+
+            # 尋找最後一個有效行（非空且包含數值）
+            df_valid = df_work.dropna(thresh=3)  # 至少 3 個非空欄位
+            if df_valid.empty:
                 if attempt < 2:
                     time.sleep(1)
                     continue
+                print(f"[export_orders] 表格全是 NaN，無有效數據")
                 return None
 
-            # 取前幾列作為欄名
-            if pd.isna(df.iloc[0, 0]):
-                df.columns = df.iloc[0]
-                df = df.iloc[1:].reset_index(drop=True)
+            last_row = df_valid.iloc[-1]
+            print(f"[export_orders] 最後一行: {list(last_row.values)[:5]}")
 
-            df_clean = df.copy()
-            df_clean.columns = ["year", "month_raw"] + list(df_clean.columns[2:])
-            df_clean["year"] = df_clean["year"].ffill()
+            # 提取年月（第 1-2 列通常是年月）
+            try:
+                year_str = str(last_row.iloc[0])
+                month_str = str(last_row.iloc[1])
+                roc_year = int(re.findall(r'\d+', year_str)[0]) if re.findall(r'\d+', year_str) else None
+                mon = int(re.findall(r'\d+', month_str)[0]) if re.findall(r'\d+', month_str) else None
 
-            # 去掉 NaN 與累計行
-            df2 = df_clean.dropna(subset=[df_clean.columns[2]])  # 第一個數值欄
-            if df2.empty:
-                if attempt < 2:
-                    time.sleep(1)
-                    continue
-                return None
+                if roc_year is None or mon is None:
+                    if attempt < 2:
+                        time.sleep(1)
+                        continue
+                    return None
 
-            df2 = df2[~df2["month_raw"].astype(str).str.contains(r"-\d", na=False)]
-            df2 = df2.copy()
+                # 提取第 3 欄數值（通常是總訂單金額年增率）
+                val_str = str(last_row.iloc[2]).replace('%', '').replace(',', '').strip()
+                value = float(val_str) if val_str else None
 
-            # 提取年份和月份
-            df2["roc"] = df2["year"].apply(
-                lambda x: int(re.findall(r"\d+", str(x))[0]) if re.findall(r"\d+", str(x)) else None)
-            df2["mon"] = df2["month_raw"].apply(
-                lambda x: int(re.findall(r"\d+", str(x))[0]) if re.findall(r"\d+", str(x)) else None)
+                if value is None:
+                    if attempt < 2:
+                        time.sleep(1)
+                        continue
+                    return None
 
-            # 提取數值（嘗試第一個數值欄）
-            val_col = df_clean.columns[2]
-            df2["val"] = pd.to_numeric(
-                df2[val_col].astype(str).str.replace(r"\s+|%|,", "", regex=True),
-                errors="coerce")
+                ad_year = roc_year + 1911
+                month = f"{ad_year}-{mon:02d}"
+                color = "#22c55e" if value >= 0 else "#ef4444"
 
-            df2 = df2.dropna(subset=["roc", "mon", "val"])
-            if df2.empty:
+                # 簡化歷史（只返回最新一筆）
+                return {
+                    "value": round(value, 1), "month": month,
+                    "history": pd.Series([value], index=[month]), "color": color,
+                }
+            except Exception as parse_err:
+                print(f"[export_orders] 列解析失敗: {str(parse_err)[:100]}")
                 if attempt < 2:
                     time.sleep(1)
                     continue
@@ -1179,9 +1203,11 @@ def get_tw_export_orders():
                 "history": history.tail(12), "color": color,
             }
         except Exception as e:
+            print(f"[export_orders] 第 {attempt+1} 次失敗：{type(e).__name__}: {str(e)[:200]}")
             if attempt < 2:
                 time.sleep(1)
 
+    print("[export_orders] 3 次重試全部失敗")
     return None
 
 
